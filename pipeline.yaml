@@ -1,0 +1,32 @@
+# milestone-pipeline 設定檔
+# 模型可自由抽換:alias(fable / opus / sonnet / haiku)或完整 model id 皆可
+
+repo:
+  path: /path/to/your/repo        # 本機 repo 路徑(orchestrator 的工作目錄)
+  base_branch: main
+  remote: origin
+
+plan:
+  path: plan.md                   # 相對 repo path,或絕對路徑
+
+implementer:
+  model: fable                    # 實作 + 修復(同一個持久 session)
+  permission_mode: acceptEdits    # 全自動可改 bypassPermissions(建議只在隔離環境)
+  max_turns: 80                   # 單次 query 的 agentic loop 上限
+  max_budget_usd: 10.0            # 每個 milestone 的 implementer session 花費上限
+
+reviewer:
+  type: script                    # script = 純 SDK 版;actions = 混合版(輪詢 GitHub Actions 的 review)
+  model: opus                     # 每輪 review 都是 fresh session
+  max_turns: 40
+  max_budget_usd: 3.0             # 每輪 review 花費上限
+  # type: actions 時使用:
+  poll_interval_sec: 60
+  poll_timeout_sec: 1800
+
+loop:
+  max_review_rounds: 5            # review ↔ fix 最多來回幾輪,超過即停下等人介入
+  compact_between_rounds: true    # 每輪 fix 後對 implementer session 下 /compact
+  merge_method: squash            # squash | merge | rebase
+
+state_file: .pipeline-state.json  # 進度存檔(相對 repo path),crash 後可 resume
