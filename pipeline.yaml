@@ -30,4 +30,20 @@ loop:
   compact_between_rounds: true    # 每輪 fix 後對 implementer session 下 /compact
   merge_method: squash            # squash | merge | rebase
 
+  # -- 人工決策關卡 ------------------------------------------------------
+  # 停下來時走 park & notify:存檔 → 通知 → 退出(exit 1),
+  # 人再用 approve / reject 恢復,不會 block 住整晚的無人值守跑。
+  merge_gate: auto                # auto = 直接 merge;ask = merge 前等人放行
+  merge_gate_from_milestone: 1    # merge_gate=ask 時,第幾個 milestone 起才要問
+                                  # (骨架期可全自動,越後面越該人看一眼)
+  gate_on_unresolved: true        # implementer 自陳與 reviewer 有爭點時停下來問人
+  gate_on_agent_error: true       # agent 超預算/超輪數/API 失敗時停下來問人,
+                                  # 而不是直接中止(session 保留,加額度後可續跑)
+
+notify:
+  channels: []                    # pr_comment | webhook | desktop,可多選;空 = 不通知
+  mention: ""                     # 例如 "@SP42K",放在通知開頭觸發 GitHub 推播
+  webhook_url: ""                 # Discord / Slack incoming webhook(選 webhook 時必填)
+  webhook_format: discord         # discord | slack | raw
+
 state_file: .pipeline-state.json  # 進度存檔(相對 repo path),crash 後可 resume

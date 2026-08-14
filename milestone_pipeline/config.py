@@ -12,6 +12,10 @@ PERMISSION_MODES = frozenset(
 )
 MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
 REVIEWER_TYPES = frozenset({"script", "actions"})
+# merge 前是否需要人工放行
+MERGE_GATES = frozenset({"auto", "ask"})
+NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop"})
+WEBHOOK_FORMATS = frozenset({"discord", "slack", "raw"})
 
 
 def _one_of(value: str, allowed: frozenset[str], field_name: str) -> str:
@@ -42,6 +46,29 @@ class LoopCfg:
     max_review_rounds: int = 5
     compact_between_rounds: bool = True
     merge_method: str = "squash"
+    # merge 前的人工關卡:auto = 直接 merge;ask = 停下來等 approve 指令
+    merge_gate: str = "auto"
+    # merge_gate=ask 時,從第幾個 milestone 開始才需要人工放行
+    # (前期骨架可以全自動,越後面越該人看一眼)
+    merge_gate_from_milestone: int = 1
+    # implementer 回報與 reviewer 有未解決分歧時,是否停下來問人
+    gate_on_unresolved: bool = True
+    # agent 回報錯誤(超預算 / 超輪數 / API 失敗)時停下來問人,而不是直接中止
+    gate_on_agent_error: bool = True
+
+    def needs_human_merge(self, milestone_index: int) -> bool:
+        """merge 前是否要停下來等人。純函式,方便單獨測試。"""
+        if self.merge_gate != "ask":
+            return False
+        return milestone_index >= self.merge_gate_from_milestone
+
+
+@dataclass
+class NotifyCfg:
+    channels: list[str] = field(default_factory=list)
+    mention: str = ""            # 例如 "@SP42K",會放在通知開頭觸發推播
+    webhook_url: str = ""
+    webhook_format: str = "discord"
 
 
 @dataclass
@@ -53,7 +80,10 @@ class Config:
     implementer: AgentCfg
     reviewer: ReviewerCfg
     loop: LoopCfg = field(default_factory=LoopCfg)
+    notify: NotifyCfg = field(default_factory=NotifyCfg)
     state_file: Path = Path(".pipeline-state.json")
+    # 只用來組出給人複製的恢復指令,不影響流程
+    config_hint: str = "pipeline.yaml"
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
@@ -70,6 +100,17 @@ class Config:
         imp = raw["implementer"]
         rev = raw["reviewer"]
         loop = raw.get("loop", {})
+        noti = raw.get("notify", {}) or {}
+
+        channels = noti.get("channels", []) or []
+        if isinstance(channels, str):       # 容忍 `channels: pr_comment` 的寫法
+            channels = [channels]
+        for ch in channels:
+            _one_of(ch, NOTIFY_CHANNELS, "notify.channels")
+        webhook_url = noti.get("webhook_url", "") or ""
+        if "webhook" in channels and not webhook_url:
+            # 設定錯誤在載入時就炸,不要等到流程跑一小時後才發現通知送不出去
+            raise SystemExit("notify.channels 含 webhook,但沒有設定 notify.webhook_url")
 
         return cls(
             repo_path=repo_path,
@@ -108,6 +149,23 @@ class Config:
                     MERGE_METHODS,
                     "loop.merge_method",
                 ),
+                merge_gate=_one_of(
+                    loop.get("merge_gate", "auto"), MERGE_GATES, "loop.merge_gate",
+                ),
+                merge_gate_from_milestone=loop.get("merge_gate_from_milestone", 1),
+                gate_on_unresolved=loop.get("gate_on_unresolved", True),
+                gate_on_agent_error=loop.get("gate_on_agent_error", True),
+            ),
+            notify=NotifyCfg(
+                channels=list(channels),
+                mention=noti.get("mention", "") or "",
+                webhook_url=webhook_url,
+                webhook_format=_one_of(
+                    noti.get("webhook_format", "discord"),
+                    WEBHOOK_FORMATS,
+                    "notify.webhook_format",
+                ),
             ),
             state_file=_resolve(raw.get("state_file", ".pipeline-state.json")),
+            config_hint=str(path),
         )

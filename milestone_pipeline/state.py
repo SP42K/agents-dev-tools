@@ -15,6 +15,7 @@ PH_REVIEW = "review"            # PR 已開,在 review ↔ fix 迴圈中
 PH_MERGE = "merge"              # 已 approve,待 merge
 PH_DONE = "done"                # 此 milestone 完成
 PH_STUCK = "stuck"              # 超過輪數上限,等人介入
+PH_AWAIT_HUMAN = "await_human"  # 停在決策點等人,用 approve / reject 恢復
 
 
 @dataclass
@@ -28,6 +29,16 @@ class MilestoneState:
     # reviewer 是「每輪各自獨立」所以要自己加總。兩者語意不同,分開存。
     implementer_cost_usd: float = 0.0
     reviewer_cost_usd: float = 0.0
+    # -- 人工決策(phase == PH_AWAIT_HUMAN 時才有意義)---------------------
+    # 新增欄位一律給預設值:state.load 會濾掉不認得的 key,所以「刪欄位」相容,
+    # 「加必填欄位」不相容(舊存檔會拿到 dataclass 預設值)。
+    await_reason: str | None = None      # notify.R_* 之一
+    await_payload: str | None = None     # 停下來當下要給人看的內容
+    await_prev_phase: str | None = None  # 放行後要回到哪個 phase
+    human_feedback: str | None = None    # reject 的理由,下一輪當 review 意見用
+    # 人已放行過 merge。沒有這個旗標,approve 之後 merge gate 會再次觸發,
+    # 變成 park → approve → park 的無限迴圈。
+    merge_approved: bool = False
 
     @property
     def cost_usd(self) -> float:

@@ -58,17 +58,41 @@ property(不是 dataclass field,所以不會進存檔)。
 prompt 已指示改用 `gh pr comment` 並繼續;流程不依賴 PR 的 review 狀態,
 verdict 走 stdout 解析。
 
-**`retry` 與 `reset` 不一樣。** `retry --milestone N` 把輪數歸零但**保留**
-PR 編號與 session_id(人工修完卡住的 PR 之後用);`reset --milestone N` 是
-整個清掉重來。改動 stuck 相關邏輯時不要把兩者合併。
+**`UNRESOLVED` 是第二個 agent↔code 契約,但方向與 `VERDICT` 相反。**
+`fix_prompt` 要求 implementer 最後一行輸出 `UNRESOLVED: YES|NO`,表示它與
+reviewer 有沒有沒談攏的爭點;有的話 orchestrator 停下來讓人裁決。
+**解析不到時回 `False`(fail-open),這與 `VERDICT` 的 fail-closed 是刻意相反的**
+—— 下游還有 reviewer 的 APPROVE 擋著,而 agent 漏掉結尾標記很常見,
+若這裡也保守處理,無人值守跑會每輪都停。呼叫端用
+`has_unresolved_marker()` 分辨「沒說」與「說了 NO」並記警告。
+契約的模板與 regex **都在 `prompts.py`**(有別於 `VERDICT` 散在兩個模組),
+新增契約請沿用這個作法。
+
+**merge gate 一定要配 `merge_approved` 旗標。** `approve` 之後 phase 回到
+`PH_MERGE`,如果不記「人已放行過」,`needs_human_merge()` 會再次成立 →
+park → approve → park 無限迴圈。任何新增的關卡都要想清楚「放行後
+憑什麼不再次觸發」。
+
+**四個人工介入指令語意都不同,不要合併。**
+`retry` 卡住(輪數用盡)後重置輪數,保留 PR 與 session;
+`approve` 放行停在決策點的 milestone;
+`reject` 打回,把 `--reason` 當成下一輪的 review 意見**直接交給 implementer
+並跳過 reviewer**(同時把輪數歸零,因為人已接手);
+`reset` 整個清掉重來。
 
 ## 慣例
 
 - 註解與 docstring 用繁體中文,識別字用英文。
 - 每個模組單一職責:`config`(載入+驗證)、`plan`(解析)、`state`(存檔)、
   `gh`(subprocess 封裝)、`prompts`(所有模板)、`runner`(SDK 回應收集)、
-  `implementer`/`reviewer`(agent 封裝)、`orchestrator`(主迴圈)。
+  `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
+  `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。
+- **通知失敗永遠不能中斷 pipeline。** `MultiNotifier` 會吞掉每個 channel 的
+  例外並記 log:狀態早就存檔了,人就算沒收到推播,`status` 也看得到。
+  新增 channel 時不要在外層再往上拋。
+- 停下來等人時走 **park & notify**(存檔 → 通知 → exit 1),不要在
+  orchestrator 裡 `input()` 等人 —— 那會讓無人值守跑不起來,且 crash 就前功盡棄。
 - `config.py` 的列舉值(`permission_mode` / `merge_method` / `reviewer.type`)
   在載入時就驗證並丟 `SystemExit`,不要延後到執行期才炸。
 - `state.py` 載入時會濾掉不認得的 key,所以刪欄位是相容的;**加**必填欄位
