@@ -48,12 +48,28 @@ python -m milestone_pipeline reset  --config my-pipeline.yaml --milestone 2
 
 `run` / `status` 在流程卡住時 exit code 為 1,方便 CI 判斷。
 
-- `retry --milestone N`:人工處理完卡住的 PR 後,把 review 輪數歸零讓迴圈
-  可以再跑,**保留** PR 編號與 implementer 的 session_id(不丟 context)。
-- `reset --milestone N`:整個 milestone 的進度清掉重來(PR、session 都不留)。
+| 指令 | 作用 |
+| --- | --- |
+| `run` | 從斷點續跑到全部 milestone 完成 |
+| `status` | 列出每個 milestone 的 phase / PR / 輪數 / 花費 |
+| `retry --milestone N` | 人工處理完卡住的 PR 後,把 review 輪數歸零讓迴圈可以再跑,**保留** PR 編號與 implementer 的 session_id(不丟 context) |
+| `reset --milestone N` | 整個 milestone 的進度清掉重來(PR、session 都不留);不加 `--milestone` 則清除全部 |
 
 Plan file 格式見 `plan.example.md`:每個 `## ` 標題一個 milestone,
 第一個標題前的內容是整體背景(每個 milestone 都會附給 implementer)。
+
+## 狀態機
+
+每個 milestone 各自有一個 phase,存在 `.pipeline-state.json`:
+
+```
+implement ──實作完成、PR 開好──▶ review ──APPROVE──▶ merge ──▶ done
+                                   │
+                                   └──輪數用完──▶ stuck ──(人工處理 + retry)──▶ review
+```
+
+存檔刻意極簡:phase、PR 編號、branch、implementer 的 session_id、
+review 輪數、兩邊的花費。任何一步 crash 都可以重跑 `run` 接回去。
 
 ## 安全與成本開關
 
@@ -69,6 +85,18 @@ Plan file 格式見 `plan.example.md`:每個 `## ` 標題一個 milestone,
   agent 會回報錯誤,orchestrator 會中止流程而不是默默繼續下一輪。
 - `loop.max_review_rounds`:防止兩個 agent 無限對話;超過上限會在
   PR 留言並停下等人工介入(`status` 會顯示 `stuck`,exit code 1)。
+
+## 開發
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+```
+
+測試都是不碰網路 / `gh` / SDK 呼叫的純邏輯測試(plan 解析、verdict 解析、
+state 讀寫、config 驗證、prompt 的 remote 處理)。不過 `reviewer.py` 在
+module level import `claude_agent_sdk`,所以仍需要安裝該套件才能收集測試。
 
 ## 已知簡化(骨架階段)
 
