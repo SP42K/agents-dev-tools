@@ -1,0 +1,22 @@
+[project]
+name = "milestone-pipeline"
+version = "0.1.0"
+description = "Plan file → 每個 milestone 自動 實作 → PR → review ↔ fix → merge"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["milestone_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

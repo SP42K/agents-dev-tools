@@ -28,9 +28,6 @@ class Gh:
         self._run("git", "checkout", base)
         self._run("git", "pull", remote, base)
 
-    def current_head_sha(self, branch: str) -> str:
-        return self._run("git", "rev-parse", branch)
-
     # -- gh ------------------------------------------------------------------
 
     def find_pr(self, branch: str) -> int | None:

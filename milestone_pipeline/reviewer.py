@@ -24,12 +24,21 @@ from .gh import Gh
 from .prompts import REVIEWER_SYSTEM, review_prompt
 from .runner import collect_response
 
+# reviewer 不改 code:`tools` 只給唯讀工具 + Bash(跑 gh)。
+# 注意 allowed_tools 只是「免詢問」清單,並不會限制工具存在與否,
+# 真正的限制要靠 `tools`。
+REVIEWER_TOOLS = ["Read", "Glob", "Grep", "Bash"]
+
+# 只認「自成一行」的 VERDICT,避免比對到 prompt 或內文裡的順帶提及。
+_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(APPROVE|REQUEST_CHANGES)\s*$", re.MULTILINE)
+
 
 @dataclass
 class ReviewResult:
     approved: bool
     feedback: str
     cost_usd: float = 0.0
+    is_error: bool = False
 
 
 class Reviewer(ABC):
@@ -52,8 +61,8 @@ class ScriptReviewer(Reviewer):
             cwd=str(self.repo_path),
             system_prompt=REVIEWER_SYSTEM,
             permission_mode=self.cfg.permission_mode,
-            # 讀 + gh 用的 Bash;不給 Edit/Write,reviewer 不改 code
-            allowed_tools=["Read", "Glob", "Grep", "Bash"],
+            tools=REVIEWER_TOOLS,
+            allowed_tools=REVIEWER_TOOLS,
             max_turns=self.cfg.max_turns,
             max_budget_usd=self.cfg.max_budget_usd,
         )
@@ -63,11 +72,11 @@ class ScriptReviewer(Reviewer):
         )
         approved = self._parse_verdict(result.text)
         return ReviewResult(approved=approved, feedback=result.text,
-                            cost_usd=result.cost_usd)
+                            cost_usd=result.cost_usd, is_error=result.is_error)
 
     @staticmethod
     def _parse_verdict(text: str) -> bool:
-        m = re.findall(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", text)
+        m = _VERDICT_RE.findall(text)
         if not m:
             # 解析不到 verdict 時保守處理:視為要求修改,把全文丟給 fixer
             return False
@@ -85,20 +94,25 @@ class ActionsReviewer(Reviewer):
         self.cfg = cfg
         self.gh = Gh(repo_path)
 
+    def _review_count(self, pr_number: int) -> int:
+        return len(self.gh.pr_view(pr_number, "reviews").get("reviews") or [])
+
     async def review(self, pr_number: int, round_no: int,
                      plan_excerpt: str) -> ReviewResult:
-        baseline = len(self.gh.pr_view(pr_number, "reviews").get("reviews") or [])
+        # gh 是同步 subprocess,丟到 thread 以免卡住 event loop。
+        baseline = await asyncio.to_thread(self._review_count, pr_number)
         deadline = time.monotonic() + self.cfg.poll_timeout_sec
 
         while time.monotonic() < deadline:
-            reviews = self.gh.pr_view(pr_number, "reviews").get("reviews") or []
+            await asyncio.sleep(self.cfg.poll_interval_sec)
+            data = await asyncio.to_thread(self.gh.pr_view, pr_number, "reviews")
+            reviews = data.get("reviews") or []
             if len(reviews) > baseline:
                 latest = reviews[-1]
                 return ReviewResult(
                     approved=(latest.get("state") == "APPROVED"),
                     feedback=latest.get("body", ""),
                 )
-            await asyncio.sleep(self.cfg.poll_interval_sec)
 
         raise TimeoutError(
             f"等不到 PR #{pr_number} 的新 review(第 {round_no} 輪);"

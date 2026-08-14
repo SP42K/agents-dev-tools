@@ -14,6 +14,10 @@ from .config import AgentCfg
 from .prompts import COMPACT, IMPLEMENTER_SYSTEM
 from .runner import AgentResult, collect_response
 
+# implementer 要能改 code、跑測試、用 git/gh,所以需要寫入類工具。
+# `tools` 決定「有哪些工具存在」,`allowed_tools` 決定「哪些不用問就能用」。
+IMPLEMENTER_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"]
+
 
 class Implementer:
     def __init__(self, cfg: AgentCfg, repo_path: Path,
@@ -30,7 +34,8 @@ class Implementer:
             cwd=str(self.repo_path),
             system_prompt=IMPLEMENTER_SYSTEM,
             permission_mode=self.cfg.permission_mode,
-            allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
+            tools=IMPLEMENTER_TOOLS,
+            allowed_tools=IMPLEMENTER_TOOLS,
             max_turns=self.cfg.max_turns,
             max_budget_usd=self.cfg.max_budget_usd,
             resume=self.resume_session_id,
