@@ -18,6 +18,7 @@ implementer:
 reviewer:
   type: script                    # script = 純 SDK 版;actions = 混合版(輪詢 GitHub Actions 的 review)
   model: opus                     # 每輪 review 都是 fresh session
+  permission_mode: default        # reviewer 只有唯讀工具,不需要 acceptEdits
   max_turns: 40
   max_budget_usd: 3.0             # 每輪 review 花費上限
   # type: actions 時使用:

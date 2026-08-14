@@ -6,7 +6,7 @@ implementer 的 session_id(用來 resume 同一個 context window)、review 輪�
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 # phases
@@ -24,7 +24,14 @@ class MilestoneState:
     branch: str | None = None
     session_id: str | None = None   # implementer 持久 session
     review_round: int = 0
-    cost_usd: float = 0.0
+    # implementer 是「單一 session 的累計花費」(SDK 每次回傳都是累計值),
+    # reviewer 是「每輪各自獨立」所以要自己加總。兩者語意不同,分開存。
+    implementer_cost_usd: float = 0.0
+    reviewer_cost_usd: float = 0.0
+
+    @property
+    def cost_usd(self) -> float:
+        return self.implementer_cost_usd + self.reviewer_cost_usd
 
 
 @dataclass
@@ -46,8 +53,13 @@ class PipelineState:
             return cls()
         raw = json.loads(path.read_text(encoding="utf-8"))
         st = cls(current=raw.get("current", 1))
+        known = {f.name for f in fields(MilestoneState)}
         for k, v in raw.get("milestones", {}).items():
-            st.milestones[k] = MilestoneState(**v)
+            # 舊版存檔可能有已移除的欄位(例如合併前的 cost_usd),
+            # 直接 **v 會 TypeError,所以濾掉不認得的 key。
+            st.milestones[k] = MilestoneState(
+                **{kk: vv for kk, vv in v.items() if kk in known}
+            )
         return st
 
     def save(self, path: Path) -> None:

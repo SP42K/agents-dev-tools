@@ -20,7 +20,8 @@ REVIEWER_SYSTEM = """\
 
 
 def implement_prompt(preamble: str, milestone_title: str, milestone_body: str,
-                     branch: str, base: str, index: int) -> str:
+                     branch: str, base: str, index: int,
+                     remote: str = "origin") -> str:
     return f"""\
 # 任務:實作 Milestone {index} 並開 PR
 
@@ -33,7 +34,7 @@ def implement_prompt(preamble: str, milestone_title: str, milestone_body: str,
 ## 步驟(必須全部完成)
 1. `git checkout -b {branch}`(從最新的 {base} 分出)
 2. 實作本 milestone,通過現有測試,必要時補新測試
-3. commit 並 `git push -u origin {branch}`
+3. commit 並 `git push -u {remote} {branch}`
 4. 用 `gh pr create --base {base}` 開 PR:
    - title 標明 Milestone {index}
    - body 包含:變更摘要、設計決策與取捨(handoff note)、測試方式
@@ -41,7 +42,8 @@ def implement_prompt(preamble: str, milestone_title: str, milestone_body: str,
 """
 
 
-def fix_prompt(feedback: str, pr_number: int, round_no: int) -> str:
+def fix_prompt(feedback: str, pr_number: int, round_no: int,
+               branch: str, remote: str = "origin") -> str:
     return f"""\
 # Reviewer 對 PR #{pr_number} 的第 {round_no} 輪意見
 
@@ -50,7 +52,7 @@ def fix_prompt(feedback: str, pr_number: int, round_no: int) -> str:
 ## 你要做的事
 1. 逐條評估上述意見。同意的:修改程式碼並確保測試通過;
    不同意的:準備清楚的理由。
-2. commit 並 push 到同一個 branch。
+2. commit 並 `git push {remote} {branch}`(同一個 branch)。
 3. 用 `gh pr comment`(或 `gh api` 回覆對應 review thread)逐條回覆:
    修了什麼、或為什麼不修。
 4. 最後回報:修改摘要 + 尚未解決的分歧(如果有)。
@@ -71,7 +73,11 @@ def review_prompt(pr_number: int, round_no: int, plan_excerpt: str) -> str:
 3. 把具體意見留在 PR 上:
    - 有問題:`gh pr review {pr_number} --request-changes --body "..."`
    - 沒問題:`gh pr review {pr_number} --approve --body "..."`
-4. 回覆的最後一行必須是以下其一(給 orchestrator 解析用):
+   注意:如果這個 PR 是用同一個 GitHub 帳號開的,GitHub 會拒絕你 review
+   自己的 PR(`Can not approve your own pull request`)。遇到這個錯誤時,
+   改用 `gh pr comment {pr_number} --body "..."` 把同樣的意見全文留在 PR 上,
+   不要重試 `gh pr review`,也不要因此中止任務。
+4. 回覆的最後一行必須是以下其一,獨立成行(給 orchestrator 解析用):
    VERDICT: APPROVE
    VERDICT: REQUEST_CHANGES
    並在 VERDICT 前面附上你留給 implementer 的完整意見全文。

@@ -42,25 +42,43 @@ plan.md 的每個 milestone:
 cp pipeline.yaml my-pipeline.yaml   # 改 repo.path、plan.path、模型等
 python -m milestone_pipeline run    --config my-pipeline.yaml
 python -m milestone_pipeline status --config my-pipeline.yaml
+python -m milestone_pipeline retry  --config my-pipeline.yaml --milestone 2
 python -m milestone_pipeline reset  --config my-pipeline.yaml --milestone 2
 ```
+
+`run` / `status` 在流程卡住時 exit code 為 1,方便 CI 判斷。
+
+- `retry --milestone N`:人工處理完卡住的 PR 後,把 review 輪數歸零讓迴圈
+  可以再跑,**保留** PR 編號與 implementer 的 session_id(不丟 context)。
+- `reset --milestone N`:整個 milestone 的進度清掉重來(PR、session 都不留)。
 
 Plan file 格式見 `plan.example.md`:每個 `## ` 標題一個 milestone,
 第一個標題前的內容是整體背景(每個 milestone 都會附給 implementer)。
 
 ## 安全與成本開關
 
+- **工具邊界**:SDK 的 `allowed_tools` 只是「免詢問」清單,**不會**限制工具
+  存在與否 —— 真正的限制要靠 `tools`。所以 reviewer 的 `tools` 只給
+  `Read/Glob/Grep/Bash`(Bash 是為了跑 `gh`),拿不到 `Edit`/`Write`。
 - `implementer.permission_mode`:`acceptEdits`(預設)自動核准檔案編輯;
   `bypassPermissions` 全自動但建議只在隔離環境(container/VM)使用。
+- `reviewer.permission_mode`:預設 `default`。reviewer 沒有寫入工具,
+  不需要(也不應該)設成 `acceptEdits`。
 - `max_budget_usd`:implementer 以「每個 milestone 的 session」計,
-  reviewer 以「每輪」計,超過即中止該次呼叫。
+  reviewer 以「每輪」計,超過即中止該次呼叫。超支或用完 `max_turns` 時
+  agent 會回報錯誤,orchestrator 會中止流程而不是默默繼續下一輪。
 - `loop.max_review_rounds`:防止兩個 agent 無限對話;超過上限會在
-  PR 留言並停下等人工介入(`status` 會顯示 `stuck`)。
+  PR 留言並停下等人工介入(`status` 會顯示 `stuck`,exit code 1)。
 
 ## 已知簡化(骨架階段)
 
-- verdict 靠 reviewer 輸出 `VERDICT: APPROVE|REQUEST_CHANGES` 最後一行
-  解析;解析失敗時保守視為要求修改。
+- verdict 靠 reviewer 輸出**自成一行**的 `VERDICT: APPROVE|REQUEST_CHANGES`
+  解析(取最後一個);解析失敗時保守視為要求修改。
+- **reviewer 與 implementer 共用同一組 `gh` 認證**,所以 GitHub 會拒絕
+  reviewer approve 自己帳號開的 PR(`Can not approve your own pull request`)。
+  prompt 已指示遇到這個錯誤時改用 `gh pr comment` 留下同樣的意見全文,
+  流程不受影響(verdict 走 stdout 解析)。要讓 review 真的顯示在 PR 的
+  review 狀態上,需要另一個 GitHub 帳號 / bot token。
 - reviewer 的行內 comment 與 fixer 的 thread 回覆用 `gh pr comment`
   簡化處理;要做到逐 thread 回覆可改用 `gh api` 的 review threads API。
 - 未處理 merge conflict(後面的 milestone 疊在最新 base 上,
