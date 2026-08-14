@@ -1,0 +1,55 @@
+# milestone-pipeline 設定:formosa-mcp(W3 起)
+#
+#   python -m milestone_pipeline status --config formosa.yaml
+#   python -m milestone_pipeline run    --config formosa.yaml
+#
+# 開跑前的前置條件(缺一個就會在半路才炸):
+#   1. .env 裡有 CWA_API_KEY / TDX_CLIENT_ID / TDX_CLIENT_SECRET
+#   2. ssh-agent 有 key —— remote 是 git@github.com,orchestrator 自己會 fetch/pull
+#   3. gh auth status 正常
+#   4. formosa-mcp 的 master 是乾淨的(orchestrator 開工前會 checkout + pull)
+
+repo:
+  path: C:/Users/t6362/Documents/formosa-mcp
+  base_branch: master             # 不是預設的 main
+  remote: origin
+
+plan:
+  path: docs/pipeline-plan.md     # 不是 docs/plan.md —— 那份是產品計畫書,
+                                  # 用 `## ` 切會得到 9 個假 milestone
+
+implementer:
+  model: fable
+  permission_mode: acceptEdits
+  max_turns: 120                  # W3 是六個 tool + 快取 + fixtures,80 太緊
+  max_budget_usd: 15.0            # 用完不會中止,會 park 等人加額度後 approve 續跑
+
+reviewer:
+  type: script
+  model: opus
+  permission_mode: default        # 唯讀工具,不需要 acceptEdits
+  max_turns: 40
+  max_budget_usd: 3.0
+
+loop:
+  max_review_rounds: 5
+  compact_between_rounds: true
+  merge_method: merge             # 對齊 repo 既有慣例(PR #1~#4 都是 merge commit)
+
+  # 每個 milestone 都是第一次接新上游(CWA / TDX / Workers / npm),
+  # W2 的教訓是 fixture 會跟著實作一起錯 —— 人在 merge 前看一眼真實回應最便宜。
+  merge_gate: ask
+  merge_gate_from_milestone: 1
+  gate_on_unresolved: true
+  gate_on_agent_error: true
+
+notify:
+  # park 之後 orchestrator 會 exit,沒通知就不會知道它停了。
+  # desktop = 人在電腦前最即時;pr_comment = 決策紀錄留在 PR 上事後可追,
+  # 且 @mention 會走 GitHub 推播(人不在電腦前時的補位)。
+  channels: [desktop, pr_comment]
+  mention: "@SP42K"
+  webhook_url: ""
+  webhook_format: discord
+
+state_file: .pipeline-state.json  # 寫進 formosa-mcp/,已加進該 repo 的 .gitignore
