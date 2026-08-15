@@ -134,9 +134,15 @@ class ClaudeBackend(AgentBackend):
 
 
 def make_backend(name: str = "claude") -> AgentBackend:
-    """樣板同 `reviewer.make_reviewer`。
+    """樣板同 `reviewer.make_reviewer`。合法值列在 `config.BACKENDS`。
 
-    合法值列在 `config.BACKENDS`,載入時就用 `_one_of` 驗過(不合法直接
-    `SystemExit`),所以這裡不重複驗,直接落到預設。
+    這裡刻意**不**像 `make_reviewer` 那樣讓不認得的值落到預設:
+    `config.BACKENDS` 與這個 dispatch 是兩個必須同步改的地方,只加前者
+    (加了新 backend 卻忘了接)會讓 pipeline 靜默跑在錯的 runtime 上 ——
+    而 backend 決定的是工具白名單與預算閘門,錯了不會有症狀,只會失去保證。
     """
+    if name != "claude":
+        raise SystemExit(
+            f"backend {name!r} 在 config.BACKENDS 裡但 make_backend() 還沒接;"
+            "兩個地方要一起改。")
     return ClaudeBackend()

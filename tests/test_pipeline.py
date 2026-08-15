@@ -970,3 +970,15 @@ def test_workspace_fingerprint_can_ignore_our_own_artifacts(tmp_path):
     # 真的 code 變動仍然要看得到
     (tmp_path / "app.py").write_text("x", encoding="utf-8")
     assert fp_of(tmp_path, ignore=[".pipeline-state.json"]) != before
+
+
+def test_make_backend_refuses_a_name_it_has_not_wired_up():
+    """config.BACKENDS 與 make_backend 是兩個要一起改的地方。
+
+    只加前者(加了新 backend 卻忘了接 dispatch)不能靜默落到 claude ——
+    backend 決定工具白名單與預算閘門,跑錯 runtime 不會有症狀,只會失去保證。
+    """
+    from milestone_pipeline.backend import ClaudeBackend, make_backend
+    assert isinstance(make_backend("claude"), ClaudeBackend)
+    with pytest.raises(SystemExit):
+        make_backend("prime-agent")
