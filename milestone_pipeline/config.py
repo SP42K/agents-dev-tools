@@ -11,7 +11,7 @@ PERMISSION_MODES = frozenset(
     {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
 )
 MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
-REVIEWER_TYPES = frozenset({"script", "actions"})
+REVIEWER_TYPES = frozenset({"script", "actions", "hybrid"})
 # merge 前是否需要人工放行
 MERGE_GATES = frozenset({"auto", "ask"})
 NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop"})
@@ -36,9 +36,17 @@ class AgentCfg:
 
 @dataclass
 class ReviewerCfg(AgentCfg):
-    type: str = "script"  # "script" | "actions"
+    type: str = "script"  # "script" | "actions" | "hybrid"
+    # type="actions" 用
     poll_interval_sec: int = 60
     poll_timeout_sec: int = 1800
+    # type="hybrid" 用(open-code-review 的委託模式)。
+    # 委託模式不呼叫 LLM,所以這裡沒有任何模型 / 金鑰 / token 預算設定。
+    ocr_exe: str = "ocr"
+    ocr_timeout_sec: int = 300     # 單次 ocr 行程的 subprocess timeout
+    ocr_exclude: str = ""          # --exclude,逗號分隔的 gitignore 樣式
+    ocr_rule_path: str = ""        # --rule,自訂規則 JSON
+    ocr_max_rule_chars: int = 40000  # 塞進 prompt 的規則字數上限,超過就截斷並註明
 
 
 @dataclass
@@ -140,6 +148,11 @@ class Config:
                 type=_one_of(rev.get("type", "script"), REVIEWER_TYPES, "reviewer.type"),
                 poll_interval_sec=rev.get("poll_interval_sec", 60),
                 poll_timeout_sec=rev.get("poll_timeout_sec", 1800),
+                ocr_exe=rev.get("ocr_exe", "ocr"),
+                ocr_timeout_sec=rev.get("ocr_timeout_sec", 300),
+                ocr_exclude=rev.get("ocr_exclude", "") or "",
+                ocr_rule_path=rev.get("ocr_rule_path", "") or "",
+                ocr_max_rule_chars=rev.get("ocr_max_rule_chars", 40000),
             ),
             loop=LoopCfg(
                 max_review_rounds=loop.get("max_review_rounds", 5),

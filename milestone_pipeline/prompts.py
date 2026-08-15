@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+from .ocr import ReviewPlan, RuleGroup
+
 IMPLEMENTER_SYSTEM = """\
 你是這個 repo 的 implementer/fixer。你在一個多輪流程中工作:
 實作 milestone → 開 PR → 收到 reviewer 意見 → 修復並回覆 → 直到 approve。
@@ -93,6 +95,15 @@ def has_unresolved_marker(text: str) -> bool:
     return bool(_UNRESOLVED_RE.search(text))
 
 
+# review_prompt 與 hybrid_review_prompt 共用的結尾契約。兩個模板都要對
+# reviewer._VERDICT_RE 負責,所以文字抽出來共用,避免只改到一邊。
+_VERDICT_INSTRUCTION = """\
+回覆的最後一行必須是以下其一,獨立成行(給 orchestrator 解析用):
+   VERDICT: APPROVE
+   VERDICT: REQUEST_CHANGES
+   並在 VERDICT 前面附上你留給 implementer 的完整意見全文。"""
+
+
 def review_prompt(pr_number: int, round_no: int, plan_excerpt: str) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
@@ -111,10 +122,106 @@ def review_prompt(pr_number: int, round_no: int, plan_excerpt: str) -> str:
    自己的 PR(`Can not approve your own pull request`)。遇到這個錯誤時,
    改用 `gh pr comment {pr_number} --body "..."` 把同樣的意見全文留在 PR 上,
    不要重試 `gh pr review`,也不要因此中止任務。
-4. 回覆的最後一行必須是以下其一,獨立成行(給 orchestrator 解析用):
-   VERDICT: APPROVE
-   VERDICT: REQUEST_CHANGES
-   並在 VERDICT 前面附上你留給 implementer 的完整意見全文。
+4. {_VERDICT_INSTRUCTION}
+"""
+
+
+# -- hybrid(open-code-review 委託模式)-------------------------------------
+
+
+def format_review_plan(plan: ReviewPlan, groups: list[RuleGroup],
+                       max_rule_chars: int = 40000) -> str:
+    """把 delegate 的兩份輸出轉成餵給 reviewer 的 markdown。純函式,不碰 I/O。
+
+    委託模式不產生 finding,它產生的是**該審什麼、該用什麼規則審**。
+    所以這段的作用是把 reviewer 的覆蓋範圍釘死,而不是給它一份結論。
+    """
+    lines: list[str] = [
+        f"以下清單由 `ocr delegate` 從 merge-base "
+        f"`{plan.merge_base[:12] or '(未知)'}` 確定性地算出,"
+        f"共 +{plan.total_insertions}/-{plan.total_deletions} 行。",
+        "",
+        f"### 必須逐一審過的 {len(plan.reviewable)} 個檔案",
+        "",
+    ]
+    if plan.reviewable:
+        lines += [
+            f"- `{f.get('path')}` ({f.get('status')}, "
+            f"+{f.get('insertions', 0)}/-{f.get('deletions', 0)})"
+            for f in plan.reviewable
+        ]
+    else:
+        lines.append("(沒有可審的檔案)")
+
+    if plan.excluded:
+        lines += ["", f"### 它跳過的 {len(plan.excluded)} 個檔案"
+                      "(**仍在 diff 裡,仍然要你自己看**)", ""]
+        lines += [
+            f"- `{f.get('path')}` (略過原因:{f.get('exclude_reason') or '未說明'})"
+            for f in plan.excluded
+        ]
+
+    if groups:
+        lines += ["", "### 各檔適用的檢查項目", ""]
+        for g in groups:
+            lines += [f"#### `{g.pattern}` — {', '.join(g.files) or '(無)'}", "",
+                      g.rule.strip(), ""]
+
+    text = "\n".join(lines).strip()
+    if len(text) > max_rule_chars:
+        # 靜默截斷會讓 reviewer 以為自己拿到了完整清單,一定要講。
+        text = (text[:max_rule_chars]
+                + f"\n\n> ⚠ 規則內容超過 {max_rule_chars} 字已截斷,"
+                  "後面的檢查項目沒有列出來,請自行補足。")
+    return text
+
+
+def ocr_unavailable_note(reason: str) -> str:
+    """OCR 這輪沒跑成功時,取代審查清單餵給 reviewer 的說明。
+
+    刻意讓 reviewer 看得到失敗原因 —— 它會把這段寫進 PR 意見,
+    這樣「OCR 長期悄悄沒在跑」不會無聲無息(見 HybridReviewer 的 fail-open)。
+    """
+    return (
+        f"**open-code-review 這輪沒有跑成功**(原因:{reason})。\n\n"
+        "沒有現成的檔案清單與檢查項目可以參考,請自行從 diff 列出所有變更檔並逐一審過。"
+    )
+
+
+def hybrid_review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
+                         ocr_section: str) -> str:
+    return f"""\
+# 任務:Review PR #{pr_number}(第 {round_no} 輪)
+
+這個 PR 對應的 milestone 規格:
+{plan_excerpt}
+
+## 審查範圍與檢查項目(open-code-review 委託模式)
+{ocr_section}
+
+## 怎麼看待上面的清單
+- **檔案清單是下限,不是上限。** 上面列出的每個檔案都要看過,一個都不能跳;
+  被它略過的檔案(例如不支援的副檔名)仍然在 diff 裡,一樣要你自己看。
+- **檢查項目是提醒,不是收斂指令。** 那份規則寫著「favor precision over recall」,
+  那是它自己的取捨;你是 merge 前唯一的關卡,清單以外的問題照樣要報。
+- 它**沒有讀過任何程式碼**,只做了檔案篩選與規則比對 ——
+  所有判斷都是你的,沒有任何結論可以直接採用。
+- 它也**不跑測試、不看 milestone 的驗收條件**,這兩件事由你負責。
+
+## 步驟
+1. `gh pr view {pr_number}` 看描述,`gh pr diff {pr_number}` 看完整 diff;
+   第 2 輪以後也要看先前的 review 討論串,確認前幾輪意見是否已處理。
+2. 需要更多上下文時,直接讀 repo 裡的相關檔案。
+3. 跑該 repo 的測試 / lint / typecheck,確認真的通過。
+4. 驗收 milestone 規格:該做的都做了嗎?有沒有做超出範圍的事?
+5. 把具體意見留在 PR 上:
+   - 有問題:`gh pr review {pr_number} --request-changes --body "..."`
+   - 沒問題:`gh pr review {pr_number} --approve --body "..."`
+   注意:如果這個 PR 是用同一個 GitHub 帳號開的,GitHub 會拒絕你 review
+   自己的 PR(`Can not approve your own pull request`)。遇到這個錯誤時,
+   改用 `gh pr comment {pr_number} --body "..."` 把同樣的意見全文留在 PR 上,
+   不要重試 `gh pr review`,也不要因此中止任務。
+6. {_VERDICT_INSTRUCTION}
 """
 
 
