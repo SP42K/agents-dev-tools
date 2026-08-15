@@ -181,7 +181,10 @@ class HybridReviewer(Reviewer):
                 plan.paths, self.base_branch, head,
                 rule_path=self.cfg.ocr_rule_path or None,
                 timeout_sec=self.cfg.ocr_timeout_sec) if plan.paths else []
-        except (OcrError, RuntimeError, KeyError, OSError) as e:
+        # ValueError 是為了 gh.pr_view() 的 json.loads —— JSONDecodeError 繼承
+        # 自 ValueError 而非 RuntimeError,漏掉它就會讓 fail-open 破功,
+        # gh 輸出一變樣整條 pipeline 就炸。
+        except (OcrError, RuntimeError, KeyError, OSError, ValueError) as e:
             # fail-open:記警告,並讓 reviewer 在 PR 意見裡也看得到這件事,
             # 免得 OCR 長期悄悄沒在跑卻沒人發現。
             log.warning("open-code-review 這輪沒跑成功,退回純 Claude review:%s", e)

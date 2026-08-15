@@ -448,7 +448,25 @@ def test_format_review_plan_announces_truncation():
     """靜默截斷會讓 reviewer 以為拿到了完整清單。"""
     from milestone_pipeline.prompts import format_review_plan
     plan, groups = _plan_and_groups()
-    text = format_review_plan(plan, groups, max_rule_chars=120)
+    text = format_review_plan(plan, groups, max_rule_chars=20)
+    assert "截斷" in text
+
+
+def test_format_review_plan_never_truncates_the_file_lists():
+    """截斷只能吃規則段。檔案清單是覆蓋範圍的下限,截掉就等於默許漏審。"""
+    from milestone_pipeline.ocr import ReviewPlan, RuleGroup
+    from milestone_pipeline.prompts import format_review_plan
+    plan = ReviewPlan(
+        merge_base="abc123def456",
+        reviewable=[{"path": f"src/f{i}.py", "status": "modified",
+                     "insertions": 5, "deletions": 1} for i in range(40)],
+        excluded=[{"path": "docs/README.md", "exclude_reason": "unsupported_ext"}])
+    groups = [RuleGroup(pattern="**/*.py", files=["src/f0.py"], rule="X" * 7000)]
+    # 上限刻意設得比檔案清單本身還小
+    text = format_review_plan(plan, groups, max_rule_chars=10)
+    assert "src/f39.py" in text          # 最後一個待審檔仍在
+    assert "docs/README.md" in text      # 被略過的檔仍被點名
+    assert "仍然要你自己看" in text
     assert "截斷" in text
 
 
@@ -483,6 +501,18 @@ def test_hybrid_prompt_frames_list_as_lower_bound():
     text = hybrid_review_prompt(7, 1, "spec", "section")
     assert "下限,不是上限" in text
     assert "不是收斂指令" in text
+
+
+def test_hybrid_scan_fails_open_on_bad_gh_json(tmp_path):
+    """gh 輸出壞掉時要 fail-open。JSONDecodeError 繼承 ValueError 不是 RuntimeError,
+    漏掉它 fail-open 就破功,整條 pipeline 會炸。"""
+    from milestone_pipeline.config import ReviewerCfg
+    from milestone_pipeline.reviewer import HybridReviewer
+    r = HybridReviewer(ReviewerCfg(model="opus", type="hybrid"), tmp_path, "master")
+    r.gh.pr_view = lambda *a, **k: (_ for _ in ()).throw(
+        json.JSONDecodeError("boom", "", 0))
+    section = r._scan(1)
+    assert "沒有跑成功" in section
 
 
 def test_ocr_unavailable_note_names_the_reason():

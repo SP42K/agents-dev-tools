@@ -161,19 +161,24 @@ def format_review_plan(plan: ReviewPlan, groups: list[RuleGroup],
             for f in plan.excluded
         ]
 
-    if groups:
-        lines += ["", "### 各檔適用的檢查項目", ""]
-        for g in groups:
-            lines += [f"#### `{g.pattern}` — {', '.join(g.files) or '(無)'}", "",
-                      g.rule.strip(), ""]
+    if not groups:
+        return "\n".join(lines).strip()
 
-    text = "\n".join(lines).strip()
-    if len(text) > max_rule_chars:
+    # 檔案清單(含被略過的那節)是覆蓋範圍的下限,**不可以被截掉**;
+    # 只截規則段。所以兩段分開組,截斷只作用在後者 —— 否則
+    # max_rule_chars 設得比檔案清單還小時,會把「仍然要你自己看」那節吃掉。
+    rule_lines: list[str] = ["", "### 各檔適用的檢查項目", ""]
+    for g in groups:
+        rule_lines += [f"#### `{g.pattern}` — {', '.join(g.files) or '(無)'}", "",
+                       g.rule.strip(), ""]
+
+    rules = "\n".join(rule_lines)
+    if len(rules) > max_rule_chars:
         # 靜默截斷會讓 reviewer 以為自己拿到了完整清單,一定要講。
-        text = (text[:max_rule_chars]
-                + f"\n\n> ⚠ 規則內容超過 {max_rule_chars} 字已截斷,"
-                  "後面的檢查項目沒有列出來,請自行補足。")
-    return text
+        rules = (rules[:max_rule_chars]
+                 + f"\n\n> ⚠ 檢查項目超過 {max_rule_chars} 字已截斷,"
+                   "後面的沒有列出來,請自行補足。")
+    return ("\n".join(lines) + "\n" + rules).strip()
 
 
 def ocr_unavailable_note(reason: str) -> str:
