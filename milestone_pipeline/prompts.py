@@ -138,6 +138,12 @@ _VERDICT_INSTRUCTION = """\
 # 這兩段就是收斂機制:哪一輪該收到什麼程度由 **code** 決定(orchestrator 知道
 # `review_round` 與上限),agent 只負責判斷。刻意不新增 phase / 狀態 / 契約,
 # 樣板同 verify gate。
+#
+# blocker 清單的第五項(對外承諾與實際行為不符)不能拿掉。formosa M6 三個最有
+# 價值的發現都是這個形狀 —— tool 描述承諾了回傳裡沒有的欄位、回應的 notes 與
+# 同一份回應的數字相反、文件說免金鑰的清單漏列兩個。這類問題 fixtures 測不出來、
+# typecheck 也過,只有 reviewer 逐字對得出來;少了這項就會被降級成「後續建議」,
+# 等於把 reviewer 唯一不可取代的能力關掉。
 
 _SCOPE_LOCK = """\
 ## 這一輪的範圍
@@ -149,6 +155,8 @@ _SCOPE_LOCK = """\
 - 資安問題
 - milestone 規格該做的沒做到
 - 測試 / lint / typecheck 沒過
+- 對外承諾與實際行為不符(tool 描述、回應裡的 notes、錯誤訊息、使用者文件,
+  說了程式其實沒做到的事)
 
 其餘的新發現(命名、風格、可以更漂亮的重構、未來才需要的擴充)一律寫成
 「後續建議」列在意見裡,**不要因此 REQUEST_CHANGES**。
@@ -159,7 +167,7 @@ _FINAL_ROUND = """\
 review 輪數上限到了,這一輪之後沒有再修的機會 —— 你如果 REQUEST_CHANGES,
 這個 milestone 會停下來等人工處理,而不是再跑一輪。
 
-所以這一輪只有 blocker 才 REQUEST_CHANGES(定義同上一節的四項)。
+所以這一輪只有 blocker 才 REQUEST_CHANGES(定義同上一節那五項)。
 其餘意見一律寫成「後續建議」留在 PR 上,然後 APPROVE。
 """
 
@@ -168,6 +176,9 @@ def round_notes(round_no: int, is_final: bool) -> str:
     """依輪數組出要插進 review prompt 的收斂段落。純函式,兩個模板共用。
 
     第 1 輪不帶 `_SCOPE_LOCK` —— 第一輪要的就是完整掃描,收斂是後續輪的事。
+
+    `is_final` 不等於「這是最後一輪」,而是「這是最後一輪**而且後面還有人**」:
+    呼叫端要同時看輪數與 `merge_gate`,理由見 `orchestrator` 算 `is_final` 的地方。
     """
     parts = []
     if round_no > 1:

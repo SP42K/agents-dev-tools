@@ -120,6 +120,23 @@ class Orchestrator:
                     m.index, reason, decision.approve_cmd)
         self.notifier.notify(decision)
 
+    def _is_final_round(self, m: Milestone, ms: MilestoneState) -> bool:
+        """要不要告訴 reviewer「這是最後一輪」(`prompts._FINAL_ROUND`)。
+
+        「輪數到頂」是 code 才知道的事,不講的話 reviewer 會以為還能無限來回,
+        而它每輪都是 fresh session,每輪都挑得出新的 nit —— 永遠不收斂。
+
+        但**只有 merge gate 會攔的時候才講**。`_FINAL_ROUND` 的語意是「非 blocker
+        一律放行」,少了 merge gate 就等於「輪數用完自動 merge」—— 把 `PH_STUCK`
+        這道 fail-closed 的安全網換成 fail-open,方向與 `VERDICT` 的 doctrine 相反。
+        `merge_gate: auto` 時寧可照舊落到 `PH_STUCK` 等人。
+
+        代價很小:`_FINAL_ROUND` 本來就只在最後一輪觸發,真正省輪數的是每輪都在的
+        `_SCOPE_LOCK`(它不受這個判斷影響)。
+        """
+        return (ms.review_round >= self.cfg.loop.max_review_rounds
+                and self.cfg.loop.needs_human_merge(m.index))
+
     def _verify(self, m: Milestone, ms: MilestoneState) -> VerifyResult:
         """reviewer approve 之後的確定性關卡。沒設命令就直接放行。
 
@@ -272,13 +289,10 @@ class Orchestrator:
                 else:
                     log.info("Review 第 %d/%d 輪…",
                              ms.review_round, self.cfg.loop.max_review_rounds)
-                    # 「這是最後一輪」是 code 才知道的事,要講給 reviewer 聽 ——
-                    # 不講的話它會以為還能無限來回,而 fresh session 每輪都會
-                    # 挑出新的 nit,永遠不收斂。
-                    is_final = ms.review_round >= self.cfg.loop.max_review_rounds
                     try:
                         review = await self.reviewer.review(
-                            ms.pr_number, ms.review_round, excerpt, is_final)
+                            ms.pr_number, ms.review_round, excerpt,
+                            self._is_final_round(m, ms))
                     except Exception as exc:  # noqa: BLE001
                         # 這一輪什麼都沒做,不能白吃一輪 —— 輪數是在呼叫**之前**
                         # 就 +1 存檔的(存檔要早於動作,才不會漏記已發生的事)。

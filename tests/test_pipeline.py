@@ -571,6 +571,9 @@ def test_round_notes_escalates_with_round():
     assert round_notes(1, False) == ""
     assert "這一輪的範圍" in round_notes(2, False)
     assert "這是最後一輪" not in round_notes(2, False)
+    # 第五項 blocker:實測最有價值的發現都是這個形狀,fixtures 與 typecheck
+    # 都測不出來。少了它,_SCOPE_LOCK 會把它降級成沒人會做的「後續建議」。
+    assert "對外承諾與實際行為不符" in round_notes(2, False)
     final = round_notes(3, True)
     assert "這一輪的範圍" in final and "這是最後一輪" in final
     # 上限為 1 時第 1 輪就是最後一輪:不鎖範圍(還沒有前一輪),但要講最後一輪
@@ -937,6 +940,24 @@ def _orchestrator(tmp_path, **over):
     from milestone_pipeline.orchestrator import Orchestrator
     (tmp_path / "plan.md").write_text("intro\n\n## M1\nbody\n", encoding="utf-8")
     return Orchestrator(_cfg(tmp_path, **over))
+
+
+def test_final_round_note_requires_a_human_merge_gate(tmp_path):
+    """`_FINAL_ROUND` 是「非 blocker 一律放行」,所以 merge_gate=auto 時不能講 ——
+    否則輪數用完會自動 merge,等於把 PH_STUCK 這道 fail-closed 換成 fail-open。"""
+    ms = MilestoneState(branch="m1")
+
+    orch = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "ask"})
+    m = orch.plan.milestones[0]
+    ms.review_round = 1
+    assert orch._is_final_round(m, ms) is False   # 還有下一輪
+    ms.review_round = 2
+    assert orch._is_final_round(m, ms) is True    # 輪數到頂 + 人還在把關
+
+    auto = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "auto"})
+    assert auto._is_final_round(auto.plan.milestones[0], ms) is False
 
 
 def test_verify_gate_skips_when_unconfigured(tmp_path):

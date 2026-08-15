@@ -73,6 +73,21 @@ agent 只負責判斷 —— 同 verify gate,不新增 phase / 狀態 / 契約�
 機制。`ActionsReviewer` 收得到 `is_final` 但只能忽略(它的 prompt 在對方 repo
 的 workflow 裡)。
 
+blocker 清單的**第五項(對外承諾與實際行為不符:tool 描述、回應的 notes、
+錯誤訊息、使用者文件)不能拿掉**。實測(formosa M6)最有價值的三個發現都是
+這個形狀,而且 fixtures 測不出來、typecheck 也過,只有 reviewer 逐字對得出來。
+少了這項,`_SCOPE_LOCK` 會把它降級成「後續建議」——而寫在已 merge 的 PR 上的
+後續建議實務上等於沒人會做。
+
+**`is_final` 綁著 `merge_gate`,不是單看輪數。** `_FINAL_ROUND` 的語意是
+「非 blocker 一律放行」,所以 `merge_gate: auto` 下它等於**輪數用完自動 merge**
+—— 把 `PH_STUCK` 這道 fail-closed 的安全網換成 fail-open,方向與 `VERDICT` 的
+doctrine 相反。因此 `is_final` 要同時滿足「輪數到頂」與
+`loop.needs_human_merge(m.index)`,`auto` 時照舊落到 `PH_STUCK` 等人。
+代價很小:`_FINAL_ROUND` 本來就只在最後一輪觸發,真正省輪數的是每輪都在的
+`_SCOPE_LOCK`。新增任何「放寬 reviewer 標準」的機制之前,先問**放寬之後誰還在
+把關**。
+
 **`UNRESOLVED` 是第二個 agent↔code 契約,但方向與 `VERDICT` 相反。**
 `fix_prompt` 要求 implementer 最後一行輸出 `UNRESOLVED: YES|NO`,表示它與
 reviewer 有沒有沒談攏的爭點;有的話 orchestrator 停下來讓人裁決。
