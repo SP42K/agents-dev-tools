@@ -33,16 +33,26 @@ implementer:
   max_budget_usd: 40.0
 
 reviewer:
-  type: script
+  # M5 起改用 hybrid(`ocr delegate`)做對照:先確定性地算出「該審哪些檔、每個檔套
+  # 哪組檢查項目」,再交給 Claude 讀 diff / 跑測試 / 下 verdict。不需要額外金鑰、
+  # 不會有第二筆帳單。M1–M4 跑的都是 script,所以這一輪的 review 意見值得跟舊的比。
+  # 注意這段是 fail-open:ocr 沒裝 / 逾時 / JSON 壞掉只記警告,起飛後看一次 log
+  # 有沒有那行警告,否則「OCR 悄悄沒在跑」不會有人發現。
+  type: hybrid
   model: opus
   permission_mode: default        # 唯讀工具,不需要 acceptEdits
-  max_turns: 40
+  # 實測(M5 第 2 輪,hybrid):40 輪不夠 —— script 版跑 M1–M4 都沒撞過,
+  # hybrid 會多拿一份 11 檔的待審清單,每個檔都去讀 = 輪數直接翻倍。
+  # 換 hybrid 的話這個值一定要跟著調。
+  max_turns: 100
   # 第 1 輪 review 就用掉 $2.05(要讀完 39 個檔案的 diff),$3 的餘裕太薄,
-  # reviewer 撞頂一樣會 park。
-  max_budget_usd: 5.0
+  # reviewer 撞頂一樣會 park。輪數拉到 100 之後跟著往上,免得換撞第二道天花板。
+  max_budget_usd: 8.0
 
 loop:
-  max_review_rounds: 5
+  # 5 → 7:M5 光是 review 就用掉 4 輪,而 verify_command 失敗時**共用同一組輪數**,
+  # 不加的話驗收失敗一兩次就落到 stuck 要人工 retry。
+  max_review_rounds: 7
   compact_between_rounds: true
   merge_method: merge             # 對齊 repo 既有慣例(PR #1~#4 都是 merge commit)
 
@@ -50,6 +60,12 @@ loop:
   # W2 的教訓是 fixture 會跟著實作一起錯 —— 人在 merge 前看一眼真實回應最便宜。
   merge_gate: ask
   merge_gate_from_milestone: 1
+
+  # M6 起開:reviewer 的「全綠」是 LLM 說它跑過,這一道是 code 跑出來的事實。
+  # 走 shell(cmd.exe)所以 `&&` 可以;M5 merge 後實測整串約 30 秒,900s 綽綽有餘。
+  # 注意 `approve` 會繞過這道關卡(人已裁決),要重驗得用 `reject`。
+  verify_command: "npm run lint && npm run typecheck && npm test"
+  verify_timeout_sec: 900
   gate_on_unresolved: true
   gate_on_agent_error: true
 

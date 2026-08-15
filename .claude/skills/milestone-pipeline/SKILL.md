@@ -230,15 +230,49 @@ Claude 認證就跑得動,也不會有第二筆帳單。**不要改成 `ocr revi
   Claude 下。它給的規則開頭寫著 `Favor precision over recall` —— 那是它的取捨,
   不是你的。`hybrid_review_prompt` 已經明講「檔案清單是**下限**、規則是**提醒**」。
 - **它不跑測試、不看 milestone 驗收條件**,而且會用 `unsupported_ext` 略過 `.md`
-  之類的檔案(prompt 會把那些點名回來)。所以 `hybrid` 不能取代 §7 的人工 merge gate。
+  之類的檔案(prompt 會把那些點名回來)。所以 `hybrid` 不能取代 §7 的人工 merge gate ——
+  **這條現在有實測佐證了,見下面的「盲點」。**
 - **這一段是 fail-open**:沒裝、逾時、JSON 壞掉,都只記警告 + 把失敗原因寫進 prompt,
   不 park。方向和 `VERDICT` 的 fail-closed 相反,理由同 `UNRESOLVED` ——
   下游還有 `VERDICT` 擋著,若這裡也 fail-closed,一台沒裝 `ocr` 的機器會每輪都停。
   **代價是「OCR 長期悄悄沒在跑」不會自己浮出來**,起飛時看一次 log 有沒有那行警告。
 
-> **還沒有實測數據。** 到目前為止(formosa milestone 1–3)跑的都是 `script`。
-> `hybrid` 值不值得,要實際跑一個 milestone 比對 review 的深度才知道 ——
-> 那還沒發生過。第一次用的人請把兩邊的 review 意見做個對照,補進這一節。
+#### 實測(formosa milestone 5,2026-08-15/16,第一筆 hybrid 數據)
+
+M1–M4 跑 `script`,M5 換 `hybrid`,同一個 repo、同樣 opus、同一個人在 merge gate 驗。
+M5 是平台整合類(離線建索引 + KV 分片查詢),20 個檔案。
+
+| 項目 | hybrid(M5) | script(M1–M4) |
+|---|---|---|
+| 每輪 reviewer 成本 | $18.14 / 8 輪 ≈ **$2.3** | $2–3 |
+| `reviewer.max_turns` | **40 不夠,要 100** | 40 四個 milestone 都沒撞過 |
+| OCR delegate 的產出 | 每輪「11–12 個檔案待審、7–9 個被略過、3 組規則」,耗時 2 秒 | — |
+
+**結論:值得用,但一定要跟著把 `max_turns` 調高。** 每輪成本相近,貴的是輪數;
+但 hybrid 多拿一份待審清單、會逐檔去讀,40 輪在第 2 輪就撞頂 park 了
+(而且是 SDK 丟例外那條路,不是 agent 自陳,見 §9)。
+
+**review 深度確實比較好。** M5 的 reviewer 每一輪都**重跑驗證前幾輪的修正**
+(「我不是看回覆信,是重跑過」),第 4 輪還自己壓了 6 個 OCR 清單沒提的方向
+(`__proto__` 當 gram、manifest `built_at` 壞掉會不會噴 NaN、KV bulk 的 JSON
+轉義膨脹實測 ×1.051)。但這**無法乾淨地歸因給 OCR** —— delegate 模式下它連
+程式碼都沒讀過,產出只有檔案清單與規則,深度更可能來自 opus 本身。
+
+##### 盲點:`.md` 被略過,而過期的文件宣稱就藏在那裡
+
+每一輪都有 **7–9 個檔案被 `unsupported_ext` 略過**,主要是 `.md`。
+`hybrid_review_prompt` 有把它們點名回來,但**四輪 review 都沒抓到**下面這件事:
+
+> M5 讓遠端版的搜尋恢復可用,但 `docs/w5-notes.md` 仍寫著
+> 「`search_datasets` 在遠端版**預設停用**」,而且沒有任何指向新筆記的指路。
+> 那份檔案不在這個 PR 的 diff 裡,所以連「被略過」都算不上 —— 它根本沒進清單。
+
+這是人在 merge gate 用 `grep` 找出來的(§7 的「去對 agent 自己寫過的數字」),
+一分鐘的事。**這正是 §7 說的模式:agent 在 milestone N 量過 / 寫過的東西,
+到 N+1 就退化成過期的宣稱,而 reviewer 不會跨 milestone 去翻舊筆記。**
+
+所以 hybrid 改變的是「這一份 diff 審得多細」,**沒有**改變「diff 之外的東西沒人看」。
+merge gate 的人工驗收該做的事一件都沒少。
 
 ### 實測基準值(opus,中型 milestone)
 
@@ -249,6 +283,8 @@ Claude 認證就跑得動,也不會有第二筆帳單。**不要改成 `ocr revi
 | `max_turns: 120` | **不夠** —— opus 把程式全寫完了,卡在 commit / push / 開 PR 之前 |
 | 一輪 review(40+ 檔案的 diff) | $2–3 |
 | `reviewer.max_budget_usd: 3.0` | 太薄,第一輪就用掉 $2.05 |
+| `reviewer.max_turns`(`script`) | 40 夠(M1–M4 沒撞過) |
+| `reviewer.max_turns`(`hybrid`) | **40 不夠,要 100** —— 多一份待審清單要逐檔讀,第 2 輪就撞頂 |
 | **難的 milestone 會超出這個級距很多** | 一個平台整合(Cloudflare Workers)跑了 **7 輪 review、約 $58**:implementer $36、reviewer $15(累加 7 輪)、外加一次人工打回 |
 
 最後一列是重點:**成本主要由 review 輪數決定,不是由實作規模決定。**
