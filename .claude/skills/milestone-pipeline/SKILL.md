@@ -288,9 +288,22 @@ merge gate 的人工驗收該做的事一件都沒少。
 | **難的 milestone 會超出這個級距很多** | 一個平台整合(Cloudflare Workers)跑了 **7 輪 review、約 $58**:implementer $36、reviewer $15(累加 7 輪)、外加一次人工打回 |
 
 最後一列是重點:**成本主要由 review 輪數決定,不是由實作規模決定。**
-review 收斂得快就便宜。看「每輪修正的 diff 有沒有變窄」——
-3 個問題 → 1 個 → 1 個是在收斂;每輪都冒出同量的新問題才是談不攏,
-那時候該人工介入(`reject` 把爭點講死)而不是讓它繼續磨。
+
+reviewer 每輪都是 fresh session,所以它天生不會收斂 —— 每一輪都是一個新的
+資深 reviewer 用新鮮眼睛掃同一份 diff,挑得出**另一組**意見。收斂靠的是
+orchestrator 依輪數插進 prompt 的兩段約束(`prompts.round_notes`):
+
+- reviewer 完整掃過一次之後:新發現只有**五類**才能擋合併(錯誤行為、資安、
+  milestone 規格沒做到、測試沒過、**對外承諾與實際行為不符**),其餘寫成
+  「後續建議」。
+- 最後一輪:只擋 blocker。**但這段只在 `merge_gate: ask` 且該 milestone 已進入
+  gate 範圍時才會插入** —— 沒有人在後面把關的話,它等於「輪數用完自動 merge」。
+  用 `merge_gate: auto` 的人不會拿到這個放寬,輪數用完照樣落到 `stuck`。
+
+**該看的指標不是總輪數,是「第 3 輪之後的 REQUEST_CHANGES 裡 blocker 佔幾個」。**
+比例接近 1 表示已經沒有收斂空間可省,輪數多是問題本身難;比例低才表示 reviewer
+在開新戰場,那時候該人工介入(`reject` 把爭點講死)而不是讓它繼續磨。
+另一個免費的訊號:每輪修正的 diff 有沒有變窄(3 個問題 → 1 個 → 1 個是在收斂)。
 
 `max_turns` 用盡與預算用盡都是 `park`(有 `gate_on_agent_error: true`),
 不是崩潰 —— 但每次都要人介入很吵,寧可一開始就給夠。
@@ -421,6 +434,11 @@ git status --short             # 正在寫哪些檔案
   而它看到的 diff 還沒有那些未 commit 的修改,大概率把同樣的意見再講一遍。
 - `reject --reason "接續你被中斷的修復,意見全文在 PR #N 的 comment 裡"` →
   跳過 reviewer,直接讓 resume 的 session 接著做。**這才是對的。**
+
+`reject` 與 `retry` 都會清掉「reviewer 已完整掃過」的旗標,所以**下一輪 reviewer
+會拿到一次不受限的完整掃描**(而不是「只確認先前意見有沒有處理」)。這是刻意的
+—— 人接手之後 implementer 往往改了遠超出你意見範圍的東西。代價是那一輪 review
+比較貴,別把它誤判成迴圈退步。
 
 ### park 的原因與對策
 
