@@ -84,9 +84,11 @@ blocker 清單的**第五項(對外承諾與實際行為不符:tool 描述、回
 (意見直接交給 implementer),所以 reviewer 一出場就是 round 2 —— 用輪數的話它
 一出場就被鎖在「人的意見」那個範圍裡,而 `reject` 的典型用法是「接續你被中斷的
 修復」,implementer 在那一輪往往改了遠超出人意見範圍的東西,這份 PR 於是**從頭到尾
-沒拿到過一次不受限的完整掃描**。不變式:**凡是把 `review_round` 歸零的地方
-(`retry` / `reject`)都要一併清掉 `reviewer_seen`** —— 兩者都表示「人已接手、
-PR 即將大幅改變」。旗標只在 reviewer 回傳且 `is_error` 為假之後才設 True;
+沒拿到過一次不受限的完整掃描**。不變式:**人已接手、PR 即將大幅改變時就要清掉
+`reviewer_seen`** —— 先前那次掃描涵蓋不到接下來的東西。目前那等於 `retry` 與
+`reject`(兩者也都會把 `review_round` 歸零),但**要清的理由是前者,不是「輪數
+歸零」這個表象** —— 拿輪數當代理,正是這一段一開始踩的那顆雷。
+旗標只在 reviewer 回傳且 `is_error` 為假之後才設 True;
 出錯那次可能只讀了半份 diff。退化方向是安全的:False 只是多一次完整掃描。
 (verify 失敗**不會**有這個問題 —— 它發生在 reviewer 已經跑過並 APPROVE 的**同一輪**
 內,只是換掉 `feedback`,不會多出一個沒有 reviewer 的輪次。)
