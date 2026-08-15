@@ -186,6 +186,12 @@ state_file: .pipeline-state.json
 | `max_turns: 120` | **不夠** —— opus 把程式全寫完了,卡在 commit / push / 開 PR 之前 |
 | 一輪 review(40+ 檔案的 diff) | $2–3 |
 | `reviewer.max_budget_usd: 3.0` | 太薄,第一輪就用掉 $2.05 |
+| **難的 milestone 會超出這個級距很多** | 一個平台整合(Cloudflare Workers)跑了 **7 輪 review、約 $58**:implementer $36、reviewer $15(累加 7 輪)、外加一次人工打回 |
+
+最後一列是重點:**成本主要由 review 輪數決定,不是由實作規模決定。**
+review 收斂得快就便宜。看「每輪修正的 diff 有沒有變窄」——
+3 個問題 → 1 個 → 1 個是在收斂;每輪都冒出同量的新問題才是談不攏,
+那時候該人工介入(`reject` 把爭點講死)而不是讓它繼續磨。
 
 `max_turns` 用盡與預算用盡都是 `park`(有 `gate_on_agent_error: true`),
 不是崩潰 —— 但每次都要人介入很吵,寧可一開始就給夠。
@@ -273,6 +279,15 @@ reviewer 會把 fixtures 驗到極致(本機重跑 lint/typecheck/test、逐條�
   第一個就列出那個行政區 —— 自己打自己的臉,但 fixtures 測不出來。
 - 一個縣市沒有上游資料集,回的是原始 400「參數錯誤」,而使用者根本沒給過縣市
   (是程式從座標推的),等於給了一個無從執行的建議。
+- 一份部署文件寫著「其他 tool 完全正常,拿的都是幾十 KB」,而**同一個 repo 自己的
+  實測筆記**寫著那兩個 tool 是 1.15 MB 與 442 KB。打回去要求量,量完發現三個 tool
+  真的超過平台上限。
+
+最後那一條是最值得學的模式:**去對 agent 自己寫過的數字**。agent 在 milestone N
+量過的東西,到 milestone N+2 常常變成沒有根據的概括。這種矛盾 fixtures 測不出來,
+reviewer 也不一定會跨 milestone 去翻舊筆記,但它會變成別人照著做卻踩空的文件。
+grep 一下宣稱(「完全正常」「綽綽有餘」「不影響」)再去翻 `docs/*-notes.md` 的
+實測表,成本很低。
 
 驗的方法是寫一支一次性腳本,直接組 context 呼叫 handler(繞過 MCP 協定):
 
@@ -326,14 +341,44 @@ git checkout master                     # 回到乾淨狀態
 **一定要空出 branch 名**,否則新 agent 的 `git checkout -b` 會失敗。
 也記得刪掉 agent 留下的臨時檔(`tmp-*.py`、`smoke-*.mjs` 之類)。
 
+### 中途叫停(例如「merge 完這個 milestone 就停」)
+
+`run` 會一路跑到全部做完,沒有「只跑一個 milestone」的開關。要停在某個
+milestone 之後,就盯 log 等 `PR #N 已 merge` 出現再砍掉 process ——
+狀態在那行 log **之前**就存好了,所以砍掉是安全的。
+
+砍晚了的話下一個 milestone 已經起跑,要收尾:
+
+```bash
+# state 裡沒有它的 session_id → 半成品沒有人接得下去,清掉重來
+git checkout master                    # 未 commit 的改動會跟著跳過來
+git restore <那些被改的檔案>            # 丟掉半成品
+rm <新增的未追蹤檔案>
+git branch -D milestone/N-...          # 先確認 rev-list --count master..HEAD 是 0
+```
+
+**盯 log 時不要用 `[IO.File]::ReadAllText`**(PowerShell):`Start-Process` 的
+redirect 還握著檔案,會一路 `IOException`。用 `Get-Content -Tail` 或帶
+`FileShare.ReadWrite` 開檔。
+
 ## 9. 已知的坑
 
 - **`tools` 才是工具白名單,`allowed_tools` 不是。** 後者只是「免詢問」。
-- **`implementer_cost_usd` 是覆寫語意**(一個 milestone 一個持久 session 的前提),
-  **resume 會打破這個前提** —— 新 session 從 0 開始累計,把先前的花費蓋掉,
-  帳面會嚴重低估。`reviewer_cost_usd` 是累加的,那個數字是準的。
-- **agent 的錯誤要自己檢查,SDK 不會丟例外。** API 失敗時 `is_error=True` 但
-  `subtype` 仍是 `"success"`,只看其中一個會漏。
+- **`implementer_cost_usd` 是覆寫語意**(一個 milestone 一個持久 session 的前提)。
+  resume 會開新 session、SDK 從 0 重新累計,所以 `MilestoneState` 用
+  `implementer_cost_base_usd` 把兩段接起來(`rebase_implementer_cost()` /
+  `record_implementer_cost()`)。**不要直接指派 `implementer_cost_usd`**,
+  那會退回舊的低估行為。`reviewer_cost_usd` 是單純累加的。
+- **agent 的錯誤有兩條路,兩條都要接。** `is_error=True` 是 agent 跑完但結果不好
+  (輪數/預算用完、上游 429),SDK **不丟例外**,而且此時 `subtype` 仍可能是
+  `"success"`,只看其中一個會漏。另一條是 SDK / CLI 控制平面自己出錯
+  (實測過 `Exception: Claude Code returned an error result: success`)、
+  連線中斷、CLI process 被外力砍掉 —— 那些是**真的丟例外**。orchestrator 已經把
+  兩條都收成 `agent_error` park;新增任何 agent 呼叫時兩條都要照顧。
+- **存檔早於動作,所以中斷會留下「已計數但沒發生」的痕跡。** `review_round` 是在
+  呼叫 reviewer **之前**就 +1 存檔的(這樣才不會漏記已發生的事),代價是崩在
+  呼叫途中會白吃一輪。orchestrator 的例外處理會把輪數退回去;若是更早版本留下的
+  狀態,用 `retry` 手動歸零。
 - **`VERDICT` 解析不到時 fail-closed(視為要求修改),`UNRESOLVED` 解析不到時
   fail-open。** 方向刻意相反,不要「統一」。
 - **reviewer 無法 approve 自己帳號開的 PR。** prompt 已指示改用 `gh pr comment`,
