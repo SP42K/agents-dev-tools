@@ -34,6 +34,27 @@ class PipelineError(RuntimeError):
     """流程中止:狀態與現實不符,人不介入就沒辦法繼續。"""
 
 
+def agent_crash_detail(what: str, exc: BaseException) -> str:
+    """把 SDK 層丟出來的例外整理成 park 用的內容。
+
+    這條路徑和 `result.is_error` **不一樣**,兩條都要接:
+
+    - `is_error`:agent 正常跑完但結果不好(`max_turns` / `max_budget_usd`
+      用完、上游 429/5xx)。SDK 回一個 `ResultMessage`,**不丟例外**。
+    - 例外:CLI 控制平面自己出錯(實測過
+      `Claude Code returned an error result: success`)、連線中斷、
+      CLI process 被外力砍掉。直接從 `async for` 裡冒出來。
+
+    只接住前者的話,後者會帶著 traceback 炸掉整個 run —— 狀態雖然存過了,
+    但人看到的是 stack trace 而不是「怎麼繼續」。
+    """
+    return (f"{what}時 SDK 丟出例外(`{type(exc).__name__}`)——"
+            "這不是 agent 回報的錯誤,是 SDK / CLI 層自己出的問題。\n\n"
+            f"```\n{str(exc)[-2000:]}\n```\n\n"
+            "多半是暫時性的(控制平面錯誤、連線中斷、process 被外力中止)。"
+            "確認環境沒問題後 approve,就會從中斷的地方接著跑。")
+
+
 class Orchestrator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -130,18 +151,28 @@ class Orchestrator:
                       m.index, m.index)
 
     async def _run_milestone(self, m: Milestone, ms: MilestoneState) -> None:
+        # resume 會開新 session、SDK 的累計值從 0 起算,所以進 milestone 時先把
+        # 已知花費固定成基準,之後的覆寫都疊在基準上(見 MilestoneState 的註解)。
+        ms.rebase_implementer_cost()
+
         async with Implementer(self.cfg.implementer, self.cfg.repo_path,
                                resume_session_id=ms.session_id) as imp:
 
             # -- Phase 1: 實作 + 開 PR ---------------------------------------
             if ms.phase == PH_IMPLEMENT:
                 self.gh.checkout_base(self.cfg.base_branch, self.cfg.remote)
-                result = await imp.ask(implement_prompt(
-                    self.plan.preamble, m.title, m.body,
-                    m.branch, self.cfg.base_branch, m.index, self.cfg.remote))
+                try:
+                    result = await imp.ask(implement_prompt(
+                        self.plan.preamble, m.title, m.body,
+                        m.branch, self.cfg.base_branch, m.index,
+                        self.cfg.remote))
+                except Exception as exc:  # noqa: BLE001 —— 見 agent_crash_detail
+                    # session_id 還沒存,approve 之後這個 milestone 會從頭重跑。
+                    self._park(m, ms, R_AGENT_ERROR,
+                               agent_crash_detail("實作", exc), PH_IMPLEMENT)
+                    return
                 ms.session_id = imp.session_id
-                # SDK 回傳的是該 session 的累計花費,所以覆寫而非累加
-                ms.implementer_cost_usd = result.cost_usd
+                ms.record_implementer_cost(result.cost_usd)
                 ms.branch = m.branch
                 self._save()
 
@@ -179,6 +210,7 @@ class Orchestrator:
                 self._save()
 
                 # 人工 reject 的理由直接當這一輪的意見,省掉一次 reviewer 呼叫
+                pending_human = ms.human_feedback
                 if ms.human_feedback:
                     log.info("第 %d 輪:用人工 reject 的意見,跳過 reviewer。",
                              ms.review_round)
@@ -188,8 +220,16 @@ class Orchestrator:
                 else:
                     log.info("Review 第 %d/%d 輪…",
                              ms.review_round, self.cfg.loop.max_review_rounds)
-                    review = await self.reviewer.review(
-                        ms.pr_number, ms.review_round, excerpt)
+                    try:
+                        review = await self.reviewer.review(
+                            ms.pr_number, ms.review_round, excerpt)
+                    except Exception as exc:  # noqa: BLE001
+                        # 這一輪什麼都沒做,不能白吃一輪 —— 輪數是在呼叫**之前**
+                        # 就 +1 存檔的(存檔要早於動作,才不會漏記已發生的事)。
+                        ms.review_round -= 1
+                        self._park(m, ms, R_AGENT_ERROR,
+                                   agent_crash_detail("review", exc), PH_REVIEW)
+                        return
                     ms.reviewer_cost_usd += review.cost_usd
                     self._save()
 
@@ -211,11 +251,20 @@ class Orchestrator:
                     feedback = review.feedback
 
                 log.info("Reviewer 要求修改,交回 implementer(同一個 session)…")
-                fix = await imp.ask(fix_prompt(
-                    feedback, ms.pr_number, ms.review_round,
-                    ms.branch or m.branch, self.cfg.remote))
+                try:
+                    fix = await imp.ask(fix_prompt(
+                        feedback, ms.pr_number, ms.review_round,
+                        ms.branch or m.branch, self.cfg.remote))
+                except Exception as exc:  # noqa: BLE001
+                    # 修復根本沒發生,所以輪數退回去。人工 reject 的意見也要還原
+                    # ——它在上面被消耗掉了,不還原的話 approve 之後就永遠遺失。
+                    ms.review_round -= 1
+                    ms.human_feedback = pending_human
+                    self._park(m, ms, R_AGENT_ERROR,
+                               agent_crash_detail("修復", exc), PH_REVIEW)
+                    return
                 ms.session_id = imp.session_id
-                ms.implementer_cost_usd = fix.cost_usd
+                ms.record_implementer_cost(fix.cost_usd)
                 self._save()
 
                 if fix.is_error:

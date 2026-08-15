@@ -29,6 +29,11 @@ class MilestoneState:
     # reviewer 是「每輪各自獨立」所以要自己加總。兩者語意不同,分開存。
     implementer_cost_usd: float = 0.0
     reviewer_cost_usd: float = 0.0
+    # resume 會開一個**新** session,SDK 的 total_cost_usd 從 0 重新起算,
+    # 所以「覆寫」只在同一個 process 內成立;跨 process 直接覆寫會把先前的花費
+    # 整段抹掉(實測 formosa milestone 3:$25.54 被 resume 後的 $11.07 蓋掉)。
+    # 這個欄位是「進入 milestone 當下的已知花費」,之後的覆寫都疊在它上面。
+    implementer_cost_base_usd: float = 0.0
     # -- 人工決策(phase == PH_AWAIT_HUMAN 時才有意義)---------------------
     # 新增欄位一律給預設值:state.load 會濾掉不認得的 key,所以「刪欄位」相容,
     # 「加必填欄位」不相容(舊存檔會拿到 dataclass 預設值)。
@@ -43,6 +48,23 @@ class MilestoneState:
     @property
     def cost_usd(self) -> float:
         return self.implementer_cost_usd + self.reviewer_cost_usd
+
+    def rebase_implementer_cost(self) -> None:
+        """進入一個 milestone 時呼叫:把目前已知的花費固定成基準。
+
+        新的 milestone(花費 0)呼叫等於沒事;resume 既有 session 時,
+        它讓接下來那個 session 的花費疊在舊花費上而不是取代它。
+        """
+        self.implementer_cost_base_usd = self.implementer_cost_usd
+
+    def record_implementer_cost(self, session_total_usd: float) -> None:
+        """記錄 implementer 花費。`session_total_usd` 是 SDK 回的 session 累計值。
+
+        同一個 session 內多次呼叫是**覆寫**(SDK 每次都給累計值),
+        跨 session 則靠 `implementer_cost_base_usd` 接起來。
+        """
+        self.implementer_cost_usd = (
+            self.implementer_cost_base_usd + session_total_usd)
 
 
 @dataclass

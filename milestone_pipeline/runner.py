@@ -22,6 +22,7 @@ async def collect_response(message_iter) -> AgentResult:
     cost = 0.0
     is_error = False
     subtype = ""
+    final = ""
 
     async for msg in message_iter:
         if isinstance(msg, AssistantMessage):
@@ -38,11 +39,20 @@ async def collect_response(message_iter) -> AgentResult:
                 bool(subtype) and subtype != "success"
             )
             result = getattr(msg, "result", None)
-            if isinstance(result, str) and result.strip():
-                chunks.append(result)
+            if isinstance(result, str):
+                final = result.strip()
+
+    text = "\n".join(chunks).strip()
+    # `ResultMessage.result` 正常情況下就是最後一則 assistant 文字的複本,
+    # 無條件接上去會讓整段回覆重複一次 —— reviewer 的意見會原封不動被
+    # 餵給 fixer 兩份,而且每輪 fix_prompt 都再嵌一次,愈滾愈大。
+    # 只在它真的帶來新東西時才接(例如 max_turns 中斷時 chunks 是空的,
+    # 或 SDK 把錯誤說明放在 result 裡)。
+    if final and final not in text:
+        text = f"{text}\n{final}".strip() if text else final
 
     return AgentResult(
-        text="\n".join(chunks).strip(),
+        text=text,
         session_id=session_id,
         cost_usd=cost,
         is_error=is_error,

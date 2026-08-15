@@ -19,17 +19,27 @@ plan:
                                   # 用 `## ` 切會得到 9 個假 milestone
 
 implementer:
-  model: fable
+  # 兩邊都用 opus。注意 milestone 1 的 session 是用 fable 開的,resume 時換模型
+  # 是否生效沒有驗證過;milestone 2 起才是乾淨的 opus session。
+  # 另外 opus 比 fable 貴,下面的 max_budget_usd 會消耗得更快。
+  model: opus
   permission_mode: acceptEdits
-  max_turns: 120                  # W3 是六個 tool + 快取 + fixtures,80 太緊
-  max_budget_usd: 15.0            # 用完不會中止,會 park 等人加額度後 approve 續跑
+  # 實測:opus 跑 W4(七個 tool + OAuth + 14 份真實錄製)在 120 turns 用盡時
+  # 程式全寫完了,卡在 commit / push / 開 PR 之前。W3 用 fable 時 120 夠用。
+  max_turns: 200
+  # 實測:W3 光是實作階段就吃掉 $15(39 個檔案、+7275 行),第 1 輪修復開始
+  # 沒多久就撞頂。resume 的是同一個 session,SDK 的 total_cost_usd 是累計值,
+  # 所以續跑前一定要把上限拉高,否則會立刻再 park。
+  max_budget_usd: 40.0
 
 reviewer:
   type: script
   model: opus
   permission_mode: default        # 唯讀工具,不需要 acceptEdits
   max_turns: 40
-  max_budget_usd: 3.0
+  # 第 1 輪 review 就用掉 $2.05(要讀完 39 個檔案的 diff),$3 的餘裕太薄,
+  # reviewer 撞頂一樣會 park。
+  max_budget_usd: 5.0
 
 loop:
   max_review_rounds: 5

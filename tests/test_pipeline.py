@@ -116,6 +116,51 @@ def test_cost_usd_is_not_persisted_as_a_field():
     assert "cost_usd" not in MilestoneState().__dataclass_fields__
 
 
+def test_implementer_cost_overwrites_within_one_session():
+    """同一個 session 內 SDK 給的是累計值,所以要覆寫而不是累加。"""
+    ms = MilestoneState()
+    ms.rebase_implementer_cost()
+    ms.record_implementer_cost(3.0)
+    ms.record_implementer_cost(8.0)   # 同一個 session 的新累計值
+    assert ms.implementer_cost_usd == 8.0
+
+
+def test_implementer_cost_survives_resume():
+    """resume 開新 session、SDK 從 0 重算,舊花費不能被蓋掉。
+
+    實測 formosa milestone 3:crash 前 $25.54,resume 後 SDK 回報 $11.07,
+    舊行為直接覆寫 → 顯示 $11.07,少報了 $25.54。
+    """
+    ms = MilestoneState()
+    ms.rebase_implementer_cost()
+    ms.record_implementer_cost(25.54)          # 第一個 process
+
+    ms.rebase_implementer_cost()               # crash 後重跑,進 milestone
+    ms.record_implementer_cost(4.0)            # 新 session 的累計值
+    assert ms.implementer_cost_usd == pytest.approx(29.54)
+    ms.record_implementer_cost(11.07)          # 同一個新 session 再回報
+    assert ms.implementer_cost_usd == pytest.approx(36.61)
+
+
+def test_cost_base_roundtrips_and_old_savefile_defaults_to_zero(tmp_path):
+    """新欄位有預設值,舊存檔載得起來(加必填欄位才會不相容)。"""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({
+        "current": 1,
+        "milestones": {"1": {"phase": "review", "implementer_cost_usd": 5.0}},
+    }), encoding="utf-8")
+    ms = PipelineState.load(p).ms(1)
+    assert ms.implementer_cost_base_usd == 0.0
+    assert ms.implementer_cost_usd == 5.0
+
+    ms.rebase_implementer_cost()
+    ms.record_implementer_cost(2.0)
+    st = PipelineState()
+    st.milestones["1"] = ms
+    st.save(p)
+    assert PipelineState.load(p).ms(1).implementer_cost_usd == pytest.approx(7.0)
+
+
 # -- config 驗證 -------------------------------------------------------------
 
 def _cfg(tmp_path, **over):
@@ -624,3 +669,23 @@ def test_make_notifier_returns_null_when_no_channels(tmp_path):
     from milestone_pipeline.config import NotifyCfg
     from milestone_pipeline.notify import NullNotifier, make_notifier
     assert isinstance(make_notifier(NotifyCfg(), tmp_path), NullNotifier)
+
+
+# -- SDK 例外的 park 內容 ----------------------------------------------------
+
+def test_agent_crash_detail_names_the_phase_and_the_exception():
+    """實測過的那顆:SDK 控制平面丟例外,不是 agent 回報的 is_error。"""
+    from milestone_pipeline.orchestrator import agent_crash_detail
+    exc = Exception("Claude Code returned an error result: success")
+    detail = agent_crash_detail("review", exc)
+    assert "review" in detail
+    assert "Exception" in detail                       # 例外型別
+    assert "returned an error result" in detail        # 原始訊息
+    assert "approve" in detail                         # 怎麼繼續
+
+
+def test_agent_crash_detail_truncates_giant_exceptions():
+    """通知通道(Discord 2000 字)與存檔都吃不下無上限的訊息。"""
+    from milestone_pipeline.orchestrator import agent_crash_detail
+    detail = agent_crash_detail("實作", RuntimeError("x" * 10_000))
+    assert detail.count("x") == 2000
