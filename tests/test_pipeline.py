@@ -565,31 +565,37 @@ def test_hybrid_prompt_frames_list_as_lower_bound():
     assert "不是收斂指令" in text
 
 
-def test_round_notes_escalates_with_round():
-    """收斂約束由 code 依輪數決定:第 1 輪完整掃描,第 2 輪起鎖範圍,最後一輪只擋 blocker。"""
+def test_round_notes_keys_on_reviewer_seen_not_round_number():
+    """鎖範圍的前提是 reviewer 真的掃過,不是「輪數 > 1」。
+
+    人工 reject 會吃掉一輪卻跳過 reviewer,所以 round_no 不是合法的代理 ——
+    用它的話 reviewer 一出場就被鎖在「人的意見」那個範圍裡。
+    """
     from milestone_pipeline.prompts import round_notes
-    assert round_notes(1, False) == ""
-    assert "這一輪的範圍" in round_notes(2, False)
-    assert "這是最後一輪" not in round_notes(2, False)
+    assert round_notes(False, False) == ""
+    assert "這一輪的範圍" in round_notes(True, False)
+    assert "這是最後一輪" not in round_notes(True, False)
     # 第五項 blocker:實測最有價值的發現都是這個形狀,fixtures 與 typecheck
     # 都測不出來。少了它,_SCOPE_LOCK 會把它降級成沒人會做的「後續建議」。
-    assert "對外承諾與實際行為不符" in round_notes(2, False)
-    final = round_notes(3, True)
-    assert "這一輪的範圍" in final and "這是最後一輪" in final
-    # 上限為 1 時第 1 輪就是最後一輪:不鎖範圍(還沒有前一輪),但要講最後一輪
-    only = round_notes(1, True)
+    assert "對外承諾與實際行為不符" in round_notes(True, False)
+    both = round_notes(True, True)
+    assert "這一輪的範圍" in both and "這是最後一輪" in both
+    # 最後一輪但 reviewer 還沒掃過(reject 後上限只剩一輪):不鎖範圍,只講最後一輪
+    only = round_notes(False, True)
     assert "這一輪的範圍" not in only and "這是最後一輪" in only
 
 
 def test_review_prompts_carry_round_notes():
     """兩個模板都要吃到收斂段落 —— 只改一個就等於 hybrid 模式沒有收斂機制。"""
     from milestone_pipeline.prompts import hybrid_review_prompt, review_prompt
-    for text in (review_prompt(7, 3, "spec", True),
-                 hybrid_review_prompt(7, 3, "spec", "section", True)):
+    for text in (review_prompt(7, 3, "spec", reviewer_seen=True, is_final=True),
+                 hybrid_review_prompt(7, 3, "spec", "section",
+                                      reviewer_seen=True, is_final=True)):
         assert "這一輪的範圍" in text
         assert "這是最後一輪" in text
-    for text in (review_prompt(7, 1, "spec"),
-                 hybrid_review_prompt(7, 1, "spec", "section")):
+    # 第 3 輪但 reviewer 沒掃過(reject 吃掉前兩輪)→ 一樣要拿到完整掃描
+    for text in (review_prompt(7, 3, "spec"),
+                 hybrid_review_prompt(7, 3, "spec", "section")):
         assert "這一輪的範圍" not in text
         assert "這是最後一輪" not in text
 
@@ -958,6 +964,12 @@ def test_final_round_note_requires_a_human_merge_gate(tmp_path):
     auto = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
                                       "loop.merge_gate": "auto"})
     assert auto._is_final_round(auto.plan.milestones[0], ms) is False
+
+    # 第二種「人其實不在關卡上」:gate=ask 但這個 milestone 還沒進入 gate 範圍
+    late = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "ask",
+                                      "loop.merge_gate_from_milestone": 3})
+    assert late._is_final_round(late.plan.milestones[0], ms) is False
 
 
 def test_verify_gate_skips_when_unconfigured(tmp_path):

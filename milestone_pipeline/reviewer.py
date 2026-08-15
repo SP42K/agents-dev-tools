@@ -56,6 +56,7 @@ class ReviewResult:
 class Reviewer(ABC):
     @abstractmethod
     async def review(self, pr_number: int, round_no: int, plan_excerpt: str,
+                     reviewer_seen: bool = False,
                      is_final: bool = False) -> ReviewResult: ...
 
 
@@ -72,9 +73,11 @@ class ScriptReviewer(Reviewer):
                               tools=REVIEWER_TOOLS)
 
     async def review(self, pr_number: int, round_no: int, plan_excerpt: str,
+                     reviewer_seen: bool = False,
                      is_final: bool = False) -> ReviewResult:
         return await self.ask_claude(
-            review_prompt(pr_number, round_no, plan_excerpt, is_final))
+            review_prompt(pr_number, round_no, plan_excerpt,
+                          reviewer_seen, is_final))
 
     async def ask_claude(self, prompt: str) -> ReviewResult:
         """起一個 fresh reviewer session 跑 prompt,解析 verdict。
@@ -112,9 +115,10 @@ class ActionsReviewer(Reviewer):
         return len(self.gh.pr_view(pr_number, "reviews").get("reviews") or [])
 
     async def review(self, pr_number: int, round_no: int, plan_excerpt: str,
+                     reviewer_seen: bool = False,
                      is_final: bool = False) -> ReviewResult:
-        # 收斂約束是 prompt 層的東西,這個 reviewer 的 prompt 在 repo 的
-        # workflow 裡,orchestrator 管不到 —— is_final 只能忽略。
+        # 收斂約束是 prompt 層的東西,這個 reviewer 的 prompt 在對方 repo 的
+        # workflow 裡,orchestrator 管不到 —— reviewer_seen / is_final 只能忽略。
         # gh 是同步 subprocess,丟到 thread 以免卡住 event loop。
         baseline = await asyncio.to_thread(self._review_count, pr_number)
         deadline = time.monotonic() + self.cfg.poll_timeout_sec
@@ -161,11 +165,12 @@ class HybridReviewer(Reviewer):
         self.ocr = Ocr(repo_path, cfg.ocr_exe)
 
     async def review(self, pr_number: int, round_no: int, plan_excerpt: str,
+                     reviewer_seen: bool = False,
                      is_final: bool = False) -> ReviewResult:
         section = await asyncio.to_thread(self._scan, pr_number)
         return await self.script.ask_claude(
             hybrid_review_prompt(pr_number, round_no, plan_excerpt, section,
-                                 is_final))
+                                 reviewer_seen, is_final))
 
     def _scan(self, pr_number: int) -> str:
         """跑 delegate preview + rule,轉成 prompt 片段。失敗就回退成說明文字。"""

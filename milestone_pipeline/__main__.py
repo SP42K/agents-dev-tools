@@ -88,6 +88,9 @@ def main() -> None:
         # 但保留 PR 編號與 implementer 的 session_id(不丟 context)。
         state, ms = _require_milestone(cfg, args)
         ms.review_round = 0
+        # 輪數歸零就要清 reviewer_seen(見 MilestoneState 的不變式):人工處理過
+        # 的 PR 內容已經不是先前那次 review 掃過的東西,下一輪要重新完整掃描。
+        ms.reviewer_seen = False
         if ms.phase == PH_STUCK:
             ms.phase = PH_REVIEW
         _rewind_and_save(cfg, state, args.milestone)
@@ -138,6 +141,10 @@ def main() -> None:
         ms.merge_approved = False
         # 人已經介入接手,給新的輪數預算(與 retry 同語意)
         ms.review_round = 0
+        # 同上的不變式。reject 的典型用法是「接續你被中斷的修復」,implementer
+        # 會在那一輪寫大量新程式碼,而人的意見範圍通常比實際改動窄很多 ——
+        # 先前那次 review 涵蓋不到,下一輪必須是不受限的完整掃描。
+        ms.reviewer_seen = False
         _clear_await(ms)
         _rewind_and_save(cfg, state, args.milestone)
         print(f"已打回 milestone {args.milestone}。下一輪會把你的意見"

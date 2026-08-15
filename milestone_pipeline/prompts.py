@@ -147,8 +147,8 @@ _VERDICT_INSTRUCTION = """\
 
 _SCOPE_LOCK = """\
 ## 這一輪的範圍
-第 1 輪已經定義了這個 PR 的問題範圍。你這一輪的主要工作是確認**先前提出的
-意見是否已經處理**。
+先前已經有一輪完整掃過這個 PR 並提出意見。你這一輪的主要工作是確認**先前提出
+的意見是否已經處理**。
 
 新發現的問題,只有符合以下之一才能影響 VERDICT:
 - 會產生錯誤行為(bug、邊界情況、資料損毀)
@@ -172,16 +172,21 @@ review 輪數上限到了,這一輪之後沒有再修的機會 —— 你如果 
 """
 
 
-def round_notes(round_no: int, is_final: bool) -> str:
-    """依輪數組出要插進 review prompt 的收斂段落。純函式,兩個模板共用。
+def round_notes(reviewer_seen: bool, is_final: bool) -> str:
+    """組出要插進 review prompt 的收斂段落。純函式,兩個模板共用。
 
-    第 1 輪不帶 `_SCOPE_LOCK` —— 第一輪要的就是完整掃描,收斂是後續輪的事。
+    兩個旗標都不是「第幾輪」的同義詞,呼叫端要算清楚才傳:
 
-    `is_final` 不等於「這是最後一輪」,而是「這是最後一輪**而且後面還有人**」:
-    呼叫端要同時看輪數與 `merge_gate`,理由見 `orchestrator` 算 `is_final` 的地方。
+    - `reviewer_seen`:reviewer **真的**完整掃過這個 PR 一次了。不能用
+      `round_no > 1` 代替 —— 人工 `reject` 的那一輪會吃掉輪數但跳過 reviewer,
+      於是 reviewer 一出場就是 round 2,一出場就被鎖在「人的意見」那個範圍裡,
+      而 implementer 在那一輪往往改了遠超出人意見範圍的東西。
+    - `is_final`:這是最後一輪**而且後面還有人**(merge gate 會攔)。
+
+    沒掃過就不鎖範圍 —— 每個 PR 至少要拿到一次不受限的完整掃描。
     """
     parts = []
-    if round_no > 1:
+    if reviewer_seen:
         parts.append(_SCOPE_LOCK)
     if is_final:
         parts.append(_FINAL_ROUND)
@@ -189,14 +194,14 @@ def round_notes(round_no: int, is_final: bool) -> str:
 
 
 def review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
-                  is_final: bool = False) -> str:
+                  reviewer_seen: bool = False, is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
-{round_notes(round_no, is_final)}
+{round_notes(reviewer_seen, is_final)}
 ## 步驟
 1. `gh pr view {pr_number}` 看描述,`gh pr diff {pr_number}` 看完整 diff;
    第 2 輪以後也要看先前的 review 討論串,確認前幾輪意見是否已處理。
@@ -280,14 +285,15 @@ def ocr_unavailable_note(reason: str) -> str:
 
 
 def hybrid_review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
-                         ocr_section: str, is_final: bool = False) -> str:
+                         ocr_section: str, reviewer_seen: bool = False,
+                         is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
-{round_notes(round_no, is_final)}
+{round_notes(reviewer_seen, is_final)}
 ## 審查範圍與檢查項目(open-code-review 委託模式)
 {ocr_section}
 

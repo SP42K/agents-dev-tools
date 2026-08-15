@@ -292,7 +292,7 @@ class Orchestrator:
                     try:
                         review = await self.reviewer.review(
                             ms.pr_number, ms.review_round, excerpt,
-                            self._is_final_round(m, ms))
+                            ms.reviewer_seen, self._is_final_round(m, ms))
                     except Exception as exc:  # noqa: BLE001
                         # 這一輪什麼都沒做,不能白吃一輪 —— 輪數是在呼叫**之前**
                         # 就 +1 存檔的(存檔要早於動作,才不會漏記已發生的事)。
@@ -311,6 +311,11 @@ class Orchestrator:
                             self._park(m, ms, R_AGENT_ERROR, detail, PH_REVIEW)
                             return
                         raise PipelineError(detail)
+
+                    # 到這裡才算「reviewer 完整掃過一次」——出錯的那次可能只讀了
+                    # 半份 diff,不該讓下一輪被 _SCOPE_LOCK 鎖在它的範圍上。
+                    # 沒存到就是 False,而 False 的代價只是多一次完整掃描。
+                    ms.reviewer_seen = True
 
                     if review.approved:
                         log.info("Reviewer APPROVE ✅")
