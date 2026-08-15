@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m milestone_pipeline approve *)",
+      "Bash(python -m milestone_pipeline status *)"
+    ]
+  }
+}
