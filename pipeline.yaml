@@ -16,7 +16,11 @@ implementer:
   max_budget_usd: 10.0            # 每個 milestone 的 implementer session 花費上限
 
 reviewer:
-  type: script                    # script = 純 SDK 版;actions = 混合版(輪詢 GitHub Actions 的 review)
+  type: script                    # script  = 純 SDK 版
+                                  # actions = 輪詢 GitHub Actions 上的 review
+                                  # hybrid  = ocr delegate 先確定性地算出「該審哪些檔、
+                                  #           每個檔套哪組檢查項目」,再交給 Claude
+                                  #           讀 diff / 跑測試 / 驗規格 / 下 verdict
   model: opus                     # 每輪 review 都是 fresh session
   permission_mode: default        # reviewer 只有唯讀工具,不需要 acceptEdits
   max_turns: 40
@@ -24,6 +28,18 @@ reviewer:
   # type: actions 時使用:
   poll_interval_sec: 60
   poll_timeout_sec: 1800
+
+  # -- type: hybrid 時使用 -----------------------------------------------
+  # 前置條件只有一個:npm i -g @alibaba-group/open-code-review
+  # 走的是 `ocr delegate`(委託模式),**不需要 OCR 自己的 LLM 金鑰** ——
+  # 它只做檔案篩選與規則比對,review 由 reviewer 的 Claude session 執行,
+  # 所以訂閱制的 Claude 也跑得動,而且不會有第二筆帳單。
+  # 沒裝 ocr 也不會擋流程:那段是 fail-open,跑不起來只記警告並退回純 Claude。
+  ocr_exe: ocr                    # 執行檔名稱或完整路徑
+  ocr_timeout_sec: 300            # 單次 ocr 行程的上限
+  ocr_exclude: ""                 # ocr --exclude,逗號分隔的 gitignore 樣式
+  ocr_rule_path: ""               # ocr --rule 的自訂規則 JSON
+  ocr_max_rule_chars: 40000       # 塞進 prompt 的規則字數上限,超過會截斷並註明
 
 loop:
   max_review_rounds: 5            # review ↔ fix 最多來回幾輪,超過即停下等人介入

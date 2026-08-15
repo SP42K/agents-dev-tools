@@ -16,6 +16,7 @@ from .gh import Gh
 from .implementer import Implementer
 from .notify import (R_AGENT_ERROR, R_MERGE_GATE, R_STUCK, R_UNRESOLVED,
                      Decision, make_notifier)
+from .ocr import Ocr
 from .plan import Milestone, Plan
 from .prompts import (fix_prompt, has_unresolved_marker, implement_prompt,
                       parse_unresolved)
@@ -39,8 +40,19 @@ class Orchestrator:
         self.plan = Plan.load(cfg.plan_path)
         self.state = PipelineState.load(cfg.state_file)
         self.gh = Gh(cfg.repo_path)
-        self.reviewer = make_reviewer(cfg.reviewer, cfg.repo_path)
+        self.reviewer = make_reviewer(cfg.reviewer, cfg.repo_path, cfg.base_branch)
         self.notifier = make_notifier(cfg.notify, cfg.repo_path)
+        self._check_ocr()
+
+    def _check_ocr(self) -> None:
+        """起飛前檢查:hybrid 少了 `ocr` 只是降級,不是錯誤,所以只記警告。"""
+        if self.cfg.reviewer.type != "hybrid":
+            return
+        if not Ocr(self.cfg.repo_path, self.cfg.reviewer.ocr_exe).available():
+            log.warning(
+                "reviewer.type=hybrid 但找不到 `%s`,review 會退化成純 Claude。"
+                "安裝:npm i -g @alibaba-group/open-code-review",
+                self.cfg.reviewer.ocr_exe)
 
     def _save(self) -> None:
         self.state.save(self.cfg.state_file)
