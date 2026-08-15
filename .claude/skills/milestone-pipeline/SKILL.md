@@ -169,6 +169,8 @@ loop:
   merge_gate_from_milestone: 1
   gate_on_unresolved: true
   gate_on_agent_error: true
+  verify_command: "pytest -q"    # 見下方「確定性驗收關卡」
+  verify_timeout_sec: 900
 
 notify:
   channels: [desktop, pr_comment]   # park 之後會 exit,沒通知不會知道
@@ -176,6 +178,20 @@ notify:
 
 state_file: .pipeline-state.json
 ```
+
+### `verify_command`:merge 前的確定性關卡
+
+reviewer 的 `VERDICT` 是 LLM 的判斷;這一道是 code 驗出來的事實。填目標 repo
+的測試/lint 命令(走 shell,所以 `pytest -q && ruff check .` 可以),**強烈建議填**
+—— 沒填的話「有沒有通過測試」完全靠 implementer 自律,而 orchestrator 從不驗證。
+
+- 在 **PR 分支**上跑,APPROVE 之後、merge 之前。
+- 失敗 → 輸出當成這一輪的意見交回 implementer,**共用 `max_review_rounds`**,
+  不會無限重試(輪數用完就落到 stuck)。
+- implementer 那輪什麼都沒改時不重跑,只會在 log 留一行
+  「workspace 沒有變動」warning —— 看到它代表迴圈空轉了,值得人看一眼。
+- `verify_timeout_sec` 要比測試實際跑的時間寬鬆(逾時算失敗)。
+- 目標 repo 沒有測試就先留空,不要為了填而填一個永遠會過的命令。
 
 ### `reviewer.type`:三選一
 
@@ -264,6 +280,31 @@ Windows 上 gh 可能裝在 `%LOCALAPPDATA%\Programs\gh\bin`(不是 `GitHub CLI\
 其他:remote 是 SSH 的話要有 ssh-agent(orchestrator 自己會 `git fetch`/`pull`);
 目標 repo 的 base branch 要乾淨;`.env` 金鑰填好。
 
+**填了 `verify_command` 的話,先自己在目標 repo 手動跑一次。** 它在 base branch
+上就該是綠的 —— 不然第一個 milestone 一 APPROVE 就會被自己的驗收命令打回,
+白燒一輪 implementer。
+
+### 跑在持久化終端裡
+
+前景跑的話終端一關那一輪就斷。`.pipeline-state.json` 讓下次可以續跑,但
+implementer 那 20–40 分鐘 / $10–15 已經付掉了。**開跑前先決定怎麼掛著。**
+
+Windows(本機環境,不用裝新工具,建議):
+
+```powershell
+Start-Process python -ArgumentList '-m','milestone_pipeline','run','--config','target.yaml' `
+  -RedirectStandardError pipeline.log -WindowStyle Hidden
+Get-Content pipeline.log -Wait -Tail 50      # 隨時 attach 看即時輸出,ctrl+c 離開不影響 pipeline
+```
+
+(agent 的文字會即時寫進這個 log,見 §5。)開機也要自動跑就改用「工作排程器」。
+
+另一條路是 [herdr](https://github.com/herdrdev/herdr)(agent-aware 終端多工器 +
+背景 server):`herdr` 起 server → 在 pane 裡跑 → `ctrl+b q` 離開 → 之後
+從任何終端 reattach。生態系有現成的遠端監看(collie PWA + push、herdr-remote、
+ccgram Telegram)。**但它的 Windows 支援仍標示 beta**,本機是 Windows 10,
+沒有非它不可的理由就用上面那招。
+
 ## 5. 跑
 
 ```bash
@@ -275,8 +316,18 @@ python -m milestone_pipeline status --config target.yaml   # 看進度
 
 exit code:`0` = 全部完成;`1` = 停下來等人或流程錯誤。
 
-**orchestrator 的 log 很稀疏**(只在階段轉換時寫),而 agent 的中間過程收在
-記憶體裡不會即時落地。要看它在做什麼,去看目標 repo 的 git 痕跡:
+**agent 的文字會即時進 log**,每則帶 `[implementer]` / `[reviewer]` 前綴,
+所以不用等 20–40 分鐘才知道它在幹嘛:
+
+```powershell
+Get-Content pipeline.log -Wait -Tail 50                      # 全部
+Select-String '^\S+ INFO \[implementer\]' pipeline.log       # 只看 implementer
+```
+
+只有 `/compact` 那段刻意不輸出(是雜訊)。
+
+**orchestrator 自己的 log 仍然很稀疏**(只在階段轉換時寫)。agent 的輸出也停了
+的話,再去看目標 repo 的 git 痕跡:
 
 ```bash
 git branch --show-current      # branch 建了沒
@@ -294,6 +345,9 @@ git status --short             # 正在寫哪些檔案
 | `reject --reason "..."` | 把 reason 當成**下一輪的 review 意見直接交給 implementer 並跳過 reviewer**,輪數歸零 |
 | `retry` | 輪數用盡卡住後重置輪數,保留 PR 與 session |
 | `reset` | 整個清掉重來 |
+
+**`approve` 會繞過 `verify_command`。** 它直接把 phase 設成 merge —— 人已經
+裁決過了。所以「我想再跑一次驗收」不能用 `approve`,要用 `reject`。
 
 ### `reject` 才是「接續中斷的工作」的正確工具
 

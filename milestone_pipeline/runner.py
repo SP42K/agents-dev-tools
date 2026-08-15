@@ -1,6 +1,8 @@
 """SDK 共用小工具:收集一次 response 的文字、session_id 與花費。"""
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -15,8 +17,34 @@ class AgentResult:
     subtype: str = ""               # "success" / "error_max_turns" / "error_max_budget_usd" …
 
 
-async def collect_response(message_iter) -> AgentResult:
-    """吃完一次 receive_response(),整理成 AgentResult。"""
+def log_text(role: str) -> Callable[[str], None]:
+    """做出一個把 agent 文字即時寫進 log 的 callable,給 collect_response 的 on_text。
+
+    agent 一輪要跑 20-40 分鐘,整段收完才回傳的話這期間 log 完全空白,
+    人只能去看目標 repo 的 git 痕跡猜它在幹嘛。
+
+    刻意**不**寫 stdout —— 無人值守跑時 handler 由 `__main__` 決定。
+    一個 TextBlock 一則 record(內容多行就多行),不逐行拆:拆行只換來 grep
+    方便,卻讓每則訊息長出一堆 timestamp。
+    """
+    rlog = logging.getLogger(f"pipeline.{role}")
+
+    def _emit(text: str) -> None:
+        body = text.strip()
+        if body:
+            rlog.info("[%s] %s", role, body)
+
+    return _emit
+
+
+async def collect_response(
+    message_iter, on_text: Callable[[str], None] | None = None
+) -> AgentResult:
+    """吃完一次 receive_response(),整理成 AgentResult。
+
+    `on_text` 是可選的旁路:每收到一塊 assistant 文字就呼叫一次,讓呼叫端
+    可以即時輸出。它**不影響**回傳值 —— `AgentResult` 的語意完全不變。
+    """
     chunks: list[str] = []
     session_id = None
     cost = 0.0
@@ -29,6 +57,8 @@ async def collect_response(message_iter) -> AgentResult:
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     chunks.append(block.text)
+                    if on_text is not None:
+                        on_text(block.text)
         elif isinstance(msg, ResultMessage):
             session_id = getattr(msg, "session_id", None)
             cost = getattr(msg, "total_cost_usd", None) or 0.0

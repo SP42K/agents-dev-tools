@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from .backend import make_backend
 from .config import Config
 from .gh import Gh
 from .implementer import Implementer
@@ -19,10 +20,11 @@ from .notify import (R_AGENT_ERROR, R_MERGE_GATE, R_STUCK, R_UNRESOLVED,
 from .ocr import Ocr
 from .plan import Milestone, Plan
 from .prompts import (fix_prompt, has_unresolved_marker, implement_prompt,
-                      parse_unresolved)
+                      parse_unresolved, verify_fail_prompt)
 from .reviewer import make_reviewer
 from .state import (PH_AWAIT_HUMAN, PH_DONE, PH_IMPLEMENT, PH_MERGE, PH_REVIEW,
                     PH_STUCK, MilestoneState, PipelineState)
+from .verify import VerifyResult, run_verify, workspace_fingerprint
 
 log = logging.getLogger("pipeline")
 
@@ -61,9 +63,24 @@ class Orchestrator:
         self.plan = Plan.load(cfg.plan_path)
         self.state = PipelineState.load(cfg.state_file)
         self.gh = Gh(cfg.repo_path)
-        self.reviewer = make_reviewer(cfg.reviewer, cfg.repo_path, cfg.base_branch)
+        # 兩個 agent 共用同一個 backend 實例(見 backend.py)
+        self.backend = make_backend(cfg.backend)
+        self.reviewer = make_reviewer(cfg.reviewer, cfg.repo_path,
+                                      cfg.base_branch, self.backend)
         self.notifier = make_notifier(cfg.notify, cfg.repo_path)
+        self._fp_ignore = self._own_artifacts()
         self._check_ocr()
+
+    def _own_artifacts(self) -> list[str]:
+        """算 workspace 指紋時要無視的自家產物(見 verify.workspace_fingerprint)。
+
+        state 檔多半就放在目標 repo 裡,而 `_save()` 每輪都會改寫它 ——
+        不排掉的話指紋每次都不一樣,「沒變動就不重跑」永遠不會生效。
+        """
+        try:
+            return [self.cfg.state_file.relative_to(self.cfg.repo_path).as_posix()]
+        except ValueError:      # state 檔在 repo 外,本來就不會出現在 git 輸出裡
+            return []
 
     def _check_ocr(self) -> None:
         """起飛前檢查:hybrid 少了 `ocr` 只是降級,不是錯誤,所以只記警告。"""
@@ -102,6 +119,40 @@ class Orchestrator:
         log.warning("⏸ Milestone %d 停下來等人(%s)。放行:%s",
                     m.index, reason, decision.approve_cmd)
         self.notifier.notify(decision)
+
+    def _verify(self, m: Milestone, ms: MilestoneState) -> VerifyResult:
+        """reviewer approve 之後的確定性關卡。沒設命令就直接放行。
+
+        失敗**不另設 phase 也不另設 R_\\* 通知理由** —— 輸出當成這一輪的 review
+        意見交回 implementer,共用既有的 max_review_rounds,輪數用完自然落到
+        既有的 PH_STUCK。
+        """
+        cmd = self.cfg.loop.verify_command
+        if not cmd.strip():
+            return VerifyResult(ok=True, skipped=True)
+
+        # verify 必須跑在 PR 的分支上。checkout_base() 只在 PH_IMPLEMENT 開頭
+        # 呼叫過,crash 後從 PH_REVIEW resume 時 repo 可能停在任何分支。
+        branch = ms.branch or m.branch
+        try:
+            self.gh.checkout(branch)
+        except RuntimeError as e:
+            raise PipelineError(f"驗收前切到 {branch} 失敗:{e}") from e
+
+        fp = workspace_fingerprint(self.cfg.repo_path, ignore=self._fp_ignore)
+        # 指紋只在失敗時存,所以「對得上」就代表上次失敗過且這輪什麼都沒改
+        if fp and fp == ms.last_verify_fingerprint:
+            log.warning("workspace 自上次驗收失敗後沒有變動,implementer 這輪等於"
+                        "沒有動作;沿用上次的輸出,不重跑 `%s`。", cmd)
+            return VerifyResult(ok=False, output=ms.last_verify_output or "")
+
+        log.info("跑驗收命令:%s", cmd)
+        result = run_verify(cmd, self.cfg.repo_path,
+                            self.cfg.loop.verify_timeout_sec)
+        ms.last_verify_fingerprint = None if result.ok else fp
+        ms.last_verify_output = None if result.ok else result.output
+        self._save()
+        return result
 
     def _pr_url(self, pr_number: int | None) -> str | None:
         if pr_number is None:
@@ -156,6 +207,7 @@ class Orchestrator:
         ms.rebase_implementer_cost()
 
         async with Implementer(self.cfg.implementer, self.cfg.repo_path,
+                               self.backend,
                                resume_session_id=ms.session_id) as imp:
 
             # -- Phase 1: 實作 + 開 PR ---------------------------------------
@@ -244,13 +296,20 @@ class Orchestrator:
 
                     if review.approved:
                         log.info("Reviewer APPROVE ✅")
-                        ms.phase = PH_MERGE
-                        self._save()
-                        break
+                        # reviewer 的 VERDICT 是 LLM 的判斷,這裡再過一道
+                        # 確定性的關卡(沒設 verify_command 就直接放行)。
+                        verify = self._verify(m, ms)
+                        if verify.ok:
+                            ms.phase = PH_MERGE
+                            self._save()
+                            break
+                        log.warning("驗收命令沒過,這一輪退回 implementer。")
+                        feedback = verify_fail_prompt(
+                            self.cfg.loop.verify_command, verify.output)
+                    else:
+                        feedback = review.feedback
 
-                    feedback = review.feedback
-
-                log.info("Reviewer 要求修改,交回 implementer(同一個 session)…")
+                log.info("交回 implementer 修改(同一個 session)…")
                 try:
                     fix = await imp.ask(fix_prompt(
                         feedback, ms.pr_number, ms.review_round,

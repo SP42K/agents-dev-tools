@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from milestone_pipeline.runner import collect_response
+from milestone_pipeline.runner import collect_response, log_text
 
 
 def _assistant(*texts: str) -> AssistantMessage:
@@ -33,12 +34,12 @@ def _result(text: str | None, *, subtype: str = "success",
     )
 
 
-def _collect(messages) -> object:
+def _collect(messages, on_text=None) -> object:
     async def gen():
         for m in messages:
             yield m
 
-    return asyncio.run(collect_response(gen()))
+    return asyncio.run(collect_response(gen(), on_text=on_text))
 
 
 def test_result_duplicate_is_not_appended() -> None:
@@ -79,3 +80,29 @@ def test_session_id_and_cost_taken_from_result() -> None:
     out = _collect([_assistant("x"), _result("x", cost=1.25)])
     assert out.session_id == "sess-1"
     assert out.cost_usd == 1.25
+
+
+# -- on_text 旁路(即時輸出)--------------------------------------------------
+
+def test_on_text_called_once_per_text_block() -> None:
+    seen: list[str] = []
+    msgs = [_assistant("第一段", "第二段"), _assistant("第三段"), _result("第三段")]
+    _collect(msgs, on_text=seen.append)
+    # 只掛在 TextBlock 上 —— ResultMessage.result 的複本不該再觸發一次
+    assert seen == ["第一段", "第二段", "第三段"]
+
+
+def test_on_text_does_not_change_result() -> None:
+    msgs = [_assistant("做到一半"), _result("預算用完了", cost=0.5)]
+    plain = _collect(msgs)
+    hooked = _collect(msgs, on_text=lambda _t: None)
+    assert hooked.text == plain.text
+    assert (hooked.cost_usd, hooked.session_id) == (plain.cost_usd, plain.session_id)
+
+
+def test_log_text_emits_and_skips_blank(caplog) -> None:
+    emit = log_text("implementer")
+    with caplog.at_level(logging.INFO, logger="pipeline.implementer"):
+        emit("在讀 config.py")
+        emit("   \n  ")          # 空白塊不該產生 log
+    assert [r.getMessage() for r in caplog.records] == ["[implementer] 在讀 config.py"]

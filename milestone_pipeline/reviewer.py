@@ -21,8 +21,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, query
-
+from .backend import AgentBackend, AgentSpec, make_backend
 from .config import ReviewerCfg
 from .gh import Gh
 from .ocr import Ocr, OcrError
@@ -33,7 +32,7 @@ from .prompts import (
     ocr_unavailable_note,
     review_prompt,
 )
-from .runner import collect_response
+from .runner import log_text
 
 log = logging.getLogger(__name__)
 
@@ -63,9 +62,14 @@ class Reviewer(ABC):
 class ScriptReviewer(Reviewer):
     """每輪都是 fresh context 的 reviewer(不被 implementer 思路污染)。"""
 
-    def __init__(self, cfg: ReviewerCfg, repo_path: Path):
+    def __init__(self, cfg: ReviewerCfg, repo_path: Path,
+                 backend: AgentBackend | None = None):
         self.cfg = cfg
         self.repo_path = repo_path
+        self.backend = backend or make_backend()
+        self.spec = AgentSpec(cfg=cfg, repo_path=repo_path,
+                              system_prompt=REVIEWER_SYSTEM,
+                              tools=REVIEWER_TOOLS)
 
     async def review(self, pr_number: int, round_no: int,
                      plan_excerpt: str) -> ReviewResult:
@@ -78,17 +82,8 @@ class ScriptReviewer(Reviewer):
         獨立成方法是給 HybridReviewer 共用的 —— 兩者的 session 設定、
         工具白名單、verdict 解析都必須完全一致,只有 prompt 不同。
         """
-        options = ClaudeAgentOptions(
-            model=self.cfg.model,
-            cwd=str(self.repo_path),
-            system_prompt=REVIEWER_SYSTEM,
-            permission_mode=self.cfg.permission_mode,
-            tools=REVIEWER_TOOLS,
-            allowed_tools=REVIEWER_TOOLS,
-            max_turns=self.cfg.max_turns,
-            max_budget_usd=self.cfg.max_budget_usd,
-        )
-        result = await collect_response(query(prompt=prompt, options=options))
+        result = await self.backend.query_once(
+            self.spec, prompt, on_text=log_text("reviewer"))
         approved = self._parse_verdict(result.text)
         return ReviewResult(approved=approved, feedback=result.text,
                             cost_usd=result.cost_usd, is_error=result.is_error)
@@ -154,11 +149,12 @@ class HybridReviewer(Reviewer):
     而 fail-closed 會讓一台沒裝 ocr 的機器每輪 review 都停下來等人。
     """
 
-    def __init__(self, cfg: ReviewerCfg, repo_path: Path, base_branch: str):
+    def __init__(self, cfg: ReviewerCfg, repo_path: Path, base_branch: str,
+                 backend: AgentBackend | None = None):
         self.cfg = cfg
         self.repo_path = repo_path
         self.base_branch = base_branch
-        self.script = ScriptReviewer(cfg, repo_path)
+        self.script = ScriptReviewer(cfg, repo_path, backend)
         self.gh = Gh(repo_path)
         self.ocr = Ocr(repo_path, cfg.ocr_exe)
 
@@ -196,9 +192,11 @@ class HybridReviewer(Reviewer):
 
 
 def make_reviewer(cfg: ReviewerCfg, repo_path: Path,
-                  base_branch: str = "main") -> Reviewer:
+                  base_branch: str = "main",
+                  backend: AgentBackend | None = None) -> Reviewer:
     if cfg.type == "actions":
+        # 這個 reviewer 不起 agent(它等 GitHub Actions),所以吃不到 backend
         return ActionsReviewer(cfg, repo_path)
     if cfg.type == "hybrid":
-        return HybridReviewer(cfg, repo_path, base_branch)
-    return ScriptReviewer(cfg, repo_path)
+        return HybridReviewer(cfg, repo_path, base_branch, backend)
+    return ScriptReviewer(cfg, repo_path, backend)

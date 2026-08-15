@@ -11,6 +11,8 @@ PERMISSION_MODES = frozenset(
     {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
 )
 MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
+# agent 跑在哪個 runtime 上(見 backend.py)。目前只有一個實作。
+BACKENDS = frozenset({"claude"})
 REVIEWER_TYPES = frozenset({"script", "actions", "hybrid"})
 # merge 前是否需要人工放行
 MERGE_GATES = frozenset({"auto", "ask"})
@@ -63,6 +65,11 @@ class LoopCfg:
     gate_on_unresolved: bool = True
     # agent 回報錯誤(超預算 / 超輪數 / API 失敗)時停下來問人,而不是直接中止
     gate_on_agent_error: bool = True
+    # reviewer approve 之後、merge 之前跑的確定性驗收命令(走 shell,
+    # 所以 `pytest && ruff check .` 這種寫法可以)。空字串 = 不跑,維持舊行為。
+    # 失敗時共用既有的 max_review_rounds,把輸出當這輪的意見交回 implementer。
+    verify_command: str = ""
+    verify_timeout_sec: int = 900
 
     def needs_human_merge(self, milestone_index: int) -> bool:
         """merge 前是否要停下來等人。純函式,方便單獨測試。"""
@@ -89,6 +96,7 @@ class Config:
     reviewer: ReviewerCfg
     loop: LoopCfg = field(default_factory=LoopCfg)
     notify: NotifyCfg = field(default_factory=NotifyCfg)
+    backend: str = "claude"     # 兩個 agent 共用同一個 runtime
     state_file: Path = Path(".pipeline-state.json")
     # 只用來組出給人複製的恢復指令,不影響流程
     config_hint: str = "pipeline.yaml"
@@ -168,6 +176,9 @@ class Config:
                 merge_gate_from_milestone=loop.get("merge_gate_from_milestone", 1),
                 gate_on_unresolved=loop.get("gate_on_unresolved", True),
                 gate_on_agent_error=loop.get("gate_on_agent_error", True),
+                # 自由字串 / 整數,不需要 _one_of
+                verify_command=loop.get("verify_command", "") or "",
+                verify_timeout_sec=loop.get("verify_timeout_sec", 900),
             ),
             notify=NotifyCfg(
                 channels=list(channels),
@@ -179,6 +190,7 @@ class Config:
                     "notify.webhook_format",
                 ),
             ),
+            backend=_one_of(raw.get("backend", "claude"), BACKENDS, "backend"),
             state_file=_resolve(raw.get("state_file", ".pipeline-state.json")),
             config_hint=str(path),
         )

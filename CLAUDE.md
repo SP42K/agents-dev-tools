@@ -98,6 +98,37 @@ fail-closed 關卡,若這裡 fail-closed,一台沒裝 `ocr` 的機器會每輪 r
 `ocr.CMD`,而 `subprocess` 不做 PATHEXT 解析,直接傳 `"ocr"` 會
 `FileNotFoundError` —— 明明 shell 裡跑得動。見 `ocr.Ocr._resolve_exe()`。
 
+**verify gate 是唯一的確定性驗收,但它刻意不新增任何流程狀態。**
+`loop.verify_command` 在 reviewer `APPROVE` **之後**跑(`orchestrator._verify()`),
+失敗時把輸出包成這一輪的意見交回 implementer(`prompts.verify_fail_prompt` →
+既有的 `fix_prompt`),phase 維持 `PH_REVIEW`。刻意**不**新增 phase、不新增
+`R_*` 通知理由、不新增 agent↔code 契約 —— 它共用既有的 `max_review_rounds`,
+輪數用完就落到既有的 `PH_STUCK`。三個容易漏的點:
+
+- **一定要先 `gh.checkout(ms.branch)`。** `checkout_base()` 只在 `PH_IMPLEMENT`
+  開頭跑過,crash 後從 `PH_REVIEW` resume 時 repo 可能停在任何分支,
+  不切就會在錯的分支上驗收。
+- **`approve` 會繞過 verify**(它直接把 phase 設成 `PH_MERGE`)。這是刻意的
+  ——人已經裁決過了 —— 但要重跑驗收就得用 `reject`。
+- **指紋只在失敗時存**,所以 `last_verify_fingerprint` 有值就等於「上次失敗過」。
+  `workspace_fingerprint()` 取不到時回 `""` → 照跑(退化方向安全)。
+  它同時看 `rev-parse HEAD` / `status --porcelain` / `diff HEAD`,第三個不能省:
+  少了它,agent 再改一次「本來就已修改」的檔案不會改變狀態碼,指紋不變 →
+  被誤判成沒動作而跳過驗收。
+
+**SDK 只能從 `backend.py` 進來。** `implementer.py` / `reviewer.py` 現在都透過
+`AgentBackend`(持久 session + 一次性 query,回傳一律是 `AgentResult`)。
+`runner.py` 仍直接 import `AssistantMessage` / `TextBlock` —— 那是**訊息解析**,
+不是 backend 選擇,不要順手搬。新增 backend 要同步加進 `config.BACKENDS`
+(載入時就 `_one_of` 驗)。**不要順手實作第二個 backend**:評估過的替代品沒有
+工具白名單也沒有權限模式,`REVIEWER_TOOLS` 靠 `tools=` 拿掉 `Edit`/`Write` 的
+**保證**會退化成 prompt 自律。
+
+**agent 的文字靠 `runner.log_text()` 即時落地。** `collect_response(..., on_text=)`
+是純旁路,不影響 `AgentResult`。`implementer.ask` 與 `ScriptReviewer.ask_claude`
+有接,`compact()` 刻意沒接(雜訊)。**不要把 `on_text` 預設成寫 stdout** ——
+無人值守跑時 handler 由 `__main__` 決定。
+
 **merge gate 一定要配 `merge_approved` 旗標。** `approve` 之後 phase 回到
 `PH_MERGE`,如果不記「人已放行過」,`needs_human_merge()` 會再次成立 →
 park → approve → park 無限迴圈。任何新增的關卡都要想清楚「放行後
@@ -114,8 +145,8 @@ park → approve → park 無限迴圈。任何新增的關卡都要想清楚「
 
 - 註解與 docstring 用繁體中文,識別字用英文。
 - 每個模組單一職責:`config`(載入+驗證)、`plan`(解析)、`state`(存檔)、
-  `gh` / `ocr`(各自一個外部 CLI 的 subprocess 封裝)、`prompts`(所有模板)、
-  `runner`(SDK 回應收集)、
+  `gh` / `ocr` / `verify`(各自一個外部命令的 subprocess 封裝)、
+  `prompts`(所有模板)、`runner`(SDK 回應收集)、`backend`(SDK 呼叫)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
   `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。

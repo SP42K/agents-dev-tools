@@ -72,6 +72,31 @@ def fix_prompt(feedback: str, pr_number: int, round_no: int,
 """
 
 
+def verify_fail_prompt(command: str, output: str) -> str:
+    """驗收命令沒過時,當成「這一輪的 review 意見」的字串。
+
+    回傳的**不是**完整 prompt —— 它會被餵進既有的 `fix_prompt()`,所以
+    `UNRESOLVED` 契約照舊由 `fix_prompt` 要求,這裡不新增任何 agent↔code 契約。
+    """
+    return f"""\
+(以下不是 reviewer 的意見。reviewer 已經 APPROVE 了,但 orchestrator 在 merge 前
+跑的確定性驗收命令沒有通過 —— 這是 code 驗出來的事實,不是判斷。)
+
+驗收命令:`{command}`
+
+輸出:
+
+```
+{output}
+```
+
+## 你要做的事
+1. 讓這個命令通過。**不要**為了讓它過而刪掉或放寬測試 ——
+   除非測試本身確實寫錯了,那就修測試並清楚說明理由。
+2. commit 並 push 到同一個 branch。
+"""
+
+
 # `UNRESOLVED` 契約的另一半。只認自成一行的形式,取最後一個 —— 與 VERDICT 同規則。
 _UNRESOLVED_RE = re.compile(r"^\s*UNRESOLVED:\s*(YES|NO)\s*$", re.MULTILINE)
 
