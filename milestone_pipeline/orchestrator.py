@@ -272,9 +272,13 @@ class Orchestrator:
                 else:
                     log.info("Review 第 %d/%d 輪…",
                              ms.review_round, self.cfg.loop.max_review_rounds)
+                    # 「這是最後一輪」是 code 才知道的事,要講給 reviewer 聽 ——
+                    # 不講的話它會以為還能無限來回,而 fresh session 每輪都會
+                    # 挑出新的 nit,永遠不收斂。
+                    is_final = ms.review_round >= self.cfg.loop.max_review_rounds
                     try:
                         review = await self.reviewer.review(
-                            ms.pr_number, ms.review_round, excerpt)
+                            ms.pr_number, ms.review_round, excerpt, is_final)
                     except Exception as exc:  # noqa: BLE001
                         # 這一輪什麼都沒做,不能白吃一輪 —— 輪數是在呼叫**之前**
                         # 就 +1 存檔的(存檔要早於動作,才不會漏記已發生的事)。

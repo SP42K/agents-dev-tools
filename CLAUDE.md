@@ -61,6 +61,18 @@ property(不是 dataclass field,所以不會進存檔)。
 prompt 已指示改用 `gh pr comment` 並繼續;流程不依賴 PR 的 review 狀態,
 verdict 走 stdout 解析。
 
+**`max_review_rounds` 是安全網,不是收斂機制。** reviewer 每輪都是 fresh
+session,所以第 3 輪的 reviewer 會用全新的眼睛掃同一份 diff,自然挑出**另一組**
+nit —— PR 越來越好卻永遠不收斂,調高上限只是在餵這個迴圈。真正的收斂在
+`prompts.round_notes()`:第 2 輪起插入 `_SCOPE_LOCK`(新發現只有 bug / 資安 /
+規格沒做到 / 測試沒過才能影響 VERDICT,其餘一律寫成「後續建議」),最後一輪
+再插入 `_FINAL_ROUND`(明講這輪 REQUEST_CHANGES 就會停下來等人,所以只擋
+blocker)。「第幾輪、是不是最後一輪」由 orchestrator 算好傳進去(`is_final`),
+agent 只負責判斷 —— 同 verify gate,不新增 phase / 狀態 / 契約。
+**兩個 review 模板都要吃到 `round_notes`**,只改一個等於 hybrid 模式沒有收斂
+機制。`ActionsReviewer` 收得到 `is_final` 但只能忽略(它的 prompt 在對方 repo
+的 workflow 裡)。
+
 **`UNRESOLVED` 是第二個 agent↔code 契約,但方向與 `VERDICT` 相反。**
 `fix_prompt` 要求 implementer 最後一行輸出 `UNRESOLVED: YES|NO`,表示它與
 reviewer 有沒有沒談攏的爭點;有的話 orchestrator 停下來讓人裁決。

@@ -565,6 +565,32 @@ def test_hybrid_prompt_frames_list_as_lower_bound():
     assert "不是收斂指令" in text
 
 
+def test_round_notes_escalates_with_round():
+    """收斂約束由 code 依輪數決定:第 1 輪完整掃描,第 2 輪起鎖範圍,最後一輪只擋 blocker。"""
+    from milestone_pipeline.prompts import round_notes
+    assert round_notes(1, False) == ""
+    assert "這一輪的範圍" in round_notes(2, False)
+    assert "這是最後一輪" not in round_notes(2, False)
+    final = round_notes(3, True)
+    assert "這一輪的範圍" in final and "這是最後一輪" in final
+    # 上限為 1 時第 1 輪就是最後一輪:不鎖範圍(還沒有前一輪),但要講最後一輪
+    only = round_notes(1, True)
+    assert "這一輪的範圍" not in only and "這是最後一輪" in only
+
+
+def test_review_prompts_carry_round_notes():
+    """兩個模板都要吃到收斂段落 —— 只改一個就等於 hybrid 模式沒有收斂機制。"""
+    from milestone_pipeline.prompts import hybrid_review_prompt, review_prompt
+    for text in (review_prompt(7, 3, "spec", True),
+                 hybrid_review_prompt(7, 3, "spec", "section", True)):
+        assert "這一輪的範圍" in text
+        assert "這是最後一輪" in text
+    for text in (review_prompt(7, 1, "spec"),
+                 hybrid_review_prompt(7, 1, "spec", "section")):
+        assert "這一輪的範圍" not in text
+        assert "這是最後一輪" not in text
+
+
 def test_hybrid_scan_fails_open_on_bad_gh_json(tmp_path):
     """gh 輸出壞掉時要 fail-open。JSONDecodeError 繼承 ValueError 不是 RuntimeError,
     漏掉它 fail-open 就破功,整條 pipeline 會炸。"""

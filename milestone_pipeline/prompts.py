@@ -129,13 +129,63 @@ _VERDICT_INSTRUCTION = """\
    並在 VERDICT 前面附上你留給 implementer 的完整意見全文。"""
 
 
-def review_prompt(pr_number: int, round_no: int, plan_excerpt: str) -> str:
+# -- 收斂約束 ---------------------------------------------------------------
+#
+# reviewer 每輪都是 fresh session(見 `reviewer.ScriptReviewer`),所以第 3 輪
+# 的 reviewer 會用全新的眼睛掃同一份 diff,自然挑出**另一組** nit ——
+# PR 越來越好但永遠不收斂。輪數上限只是安全網,不是收斂機制。
+#
+# 這兩段就是收斂機制:哪一輪該收到什麼程度由 **code** 決定(orchestrator 知道
+# `review_round` 與上限),agent 只負責判斷。刻意不新增 phase / 狀態 / 契約,
+# 樣板同 verify gate。
+
+_SCOPE_LOCK = """\
+## 這一輪的範圍
+第 1 輪已經定義了這個 PR 的問題範圍。你這一輪的主要工作是確認**先前提出的
+意見是否已經處理**。
+
+新發現的問題,只有符合以下之一才能影響 VERDICT:
+- 會產生錯誤行為(bug、邊界情況、資料損毀)
+- 資安問題
+- milestone 規格該做的沒做到
+- 測試 / lint / typecheck 沒過
+
+其餘的新發現(命名、風格、可以更漂亮的重構、未來才需要的擴充)一律寫成
+「後續建議」列在意見裡,**不要因此 REQUEST_CHANGES**。
+"""
+
+_FINAL_ROUND = """\
+## 這是最後一輪
+review 輪數上限到了,這一輪之後沒有再修的機會 —— 你如果 REQUEST_CHANGES,
+這個 milestone 會停下來等人工處理,而不是再跑一輪。
+
+所以這一輪只有 blocker 才 REQUEST_CHANGES(定義同上一節的四項)。
+其餘意見一律寫成「後續建議」留在 PR 上,然後 APPROVE。
+"""
+
+
+def round_notes(round_no: int, is_final: bool) -> str:
+    """依輪數組出要插進 review prompt 的收斂段落。純函式,兩個模板共用。
+
+    第 1 輪不帶 `_SCOPE_LOCK` —— 第一輪要的就是完整掃描,收斂是後續輪的事。
+    """
+    parts = []
+    if round_no > 1:
+        parts.append(_SCOPE_LOCK)
+    if is_final:
+        parts.append(_FINAL_ROUND)
+    return "\n".join(parts)
+
+
+def review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
+                  is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
+{round_notes(round_no, is_final)}
 ## 步驟
 1. `gh pr view {pr_number}` 看描述,`gh pr diff {pr_number}` 看完整 diff;
    第 2 輪以後也要看先前的 review 討論串,確認前幾輪意見是否已處理。
@@ -219,13 +269,14 @@ def ocr_unavailable_note(reason: str) -> str:
 
 
 def hybrid_review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
-                         ocr_section: str) -> str:
+                         ocr_section: str, is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
+{round_notes(round_no, is_final)}
 ## 審查範圍與檢查項目(open-code-review 委託模式)
 {ocr_section}
 
