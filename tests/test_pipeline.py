@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -20,6 +21,11 @@ from milestone_pipeline.state import (PH_AWAIT_HUMAN, PH_MERGE, MilestoneState,
                                       PipelineState)
 from milestone_pipeline.verify import (fingerprint, run_verify,
                                        workspace_fingerprint)
+
+# 驗收測試要一個「兩個平台都一定跑得起來」的命令。**不要寫 `python`** ——
+# macOS 上沒有那支(只有 `python3`),`shell=True` 會直接回 127。
+# 引號是給路徑有空白的情況用的,cmd.exe 與 sh 都認。
+PY = f'"{sys.executable}"'
 
 
 # -- plan 解析 ---------------------------------------------------------------
@@ -409,8 +415,9 @@ def test_ocr_resolves_windows_shim_and_falls_back(tmp_path):
     # 解不到時原樣退回,讓 subprocess 自己丟 FileNotFoundError
     assert Ocr(tmp_path, exe="definitely-not-a-real-exe")._resolve_exe() \
         == "definitely-not-a-real-exe"
-    # 解得到時要拿到 which 給的完整路徑(用一定存在的 python 當代理)
-    assert Ocr(tmp_path, exe="python")._resolve_exe() == shutil.which("python")
+    # 解得到時要拿到 which 給的完整路徑(用 `git` 當代理:兩個平台都一定有,
+    # 而 macOS 上沒有 `python` 這支 —— 只有 `python3`)
+    assert Ocr(tmp_path, exe="git")._resolve_exe() == shutil.which("git")
 
 
 # `ocr delegate preview --format json` 的實際輸出(v1.9.4,已精簡)
@@ -724,22 +731,22 @@ def test_verify_skipped_when_no_command(tmp_path):
 
 
 def test_verify_success(tmp_path):
-    r = run_verify('python -c "print(\'ok\')"', tmp_path, timeout_sec=60)
+    r = run_verify(f'{PY} -c "print(\'ok\')"', tmp_path, timeout_sec=60)
     assert r.ok is True
     assert r.skipped is False
     assert "ok" in r.output
 
 
 def test_verify_failure_is_not_ok(tmp_path):
-    # Windows 上 `false` 不存在,用 python 比較保險
-    r = run_verify('python -c "raise SystemExit(1)"', tmp_path, timeout_sec=60)
+    # Windows 上 `false` 不存在,用直譯器比較保險
+    r = run_verify(f'{PY} -c "raise SystemExit(1)"', tmp_path, timeout_sec=60)
     assert r.ok is False
     assert r.returncode == 1
 
 
 def test_verify_shell_chaining_short_circuits(tmp_path):
     """shell=True 是刻意的:使用者要能寫 `a && b`。"""
-    r = run_verify('python -c "raise SystemExit(1)" && python -c "print(1)"',
+    r = run_verify(f'{PY} -c "raise SystemExit(1)" && {PY} -c "print(1)"',
                    tmp_path, timeout_sec=60)
     assert r.ok is False
 
@@ -747,7 +754,7 @@ def test_verify_shell_chaining_short_circuits(tmp_path):
 def test_verify_truncates_output_from_the_tail(tmp_path):
     """錯誤訊息通常在最後,而且靜默截斷會讓 implementer 以為拿到全文。"""
     r = run_verify(
-        'python -c "print(\'a\'*200 + \'TAIL_MARKER\')"',
+        f'{PY} -c "print(\'a\'*200 + \'TAIL_MARKER\')"',
         tmp_path, timeout_sec=60, max_output_chars=50)
     assert "TAIL_MARKER" in r.output
     assert "截斷" in r.output
@@ -917,7 +924,7 @@ def test_verify_gate_skips_when_unconfigured(tmp_path):
 def test_verify_gate_reuses_output_until_the_workspace_changes(tmp_path, caplog):
     marker = tmp_path.parent / "verify-runs.txt"   # 放 repo 外,免得自己改變指紋
     marker.unlink(missing_ok=True)
-    cmd = (f'python -c "open(r\'{marker}\',\'a\').write(\'x\'); '
+    cmd = (f'{PY} -c "open(r\'{marker}\',\'a\').write(\'x\'); '
            'print(\'boom\'); raise SystemExit(1)"')
     orch = _orchestrator(tmp_path, **{"loop.verify_command": cmd})
     _git_repo(tmp_path)
@@ -944,7 +951,7 @@ def test_verify_gate_reuses_output_until_the_workspace_changes(tmp_path, caplog)
 
 
 def test_verify_gate_clears_the_cache_after_a_pass(tmp_path):
-    orch = _orchestrator(tmp_path, **{"loop.verify_command": "python -c pass"})
+    orch = _orchestrator(tmp_path, **{"loop.verify_command": f"{PY} -c pass"})
     _git_repo(tmp_path)
     ms = MilestoneState(branch="m1",
                         last_verify_fingerprint="舊", last_verify_output="舊輸出")

@@ -335,6 +335,20 @@ Get-Content pipeline.log -Wait -Tail 50      # 隨時 attach 看即時輸出,ctr
 
 (agent 的文字會即時寫進這個 log,見 §5。)開機也要自動跑就改用「工作排程器」。
 
+macOS / Linux(例如整條 pipeline 跑在另一台機器上、從本機 `ssh` 進去看):
+
+```bash
+cd ~/Documents/agents-dev-tools
+nohup .venv/bin/python -m milestone_pipeline run --config target.yaml \
+  >> /tmp/pipeline.log 2>&1 &
+tail -f /tmp/pipeline.log                    # ctrl+c 離開不影響 pipeline
+```
+
+`ssh host 'nohup ... &'` 也可以 —— 連線斷掉 process 會活著。要能重新 attach
+互動就用 `tmux`。**注意 `notify.channels` 的 `desktop` 是寫死 PowerShell 的
+(`notify.py`),在 mac / Linux 上會失敗** —— 通知失敗不會中斷 pipeline(只記 log),
+但等於沒有桌面通知,要留一條 `pr_comment` 或 `webhook`。
+
 另一條路是 [herdr](https://github.com/herdrdev/herdr)(agent-aware 終端多工器 +
 背景 server):`herdr` 起 server → 在 pane 裡跑 → `ctrl+b q` 離開 → 之後
 從任何終端 reattach。生態系有現成的遠端監看(collie PWA + push、herdr-remote、

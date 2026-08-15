@@ -10,7 +10,9 @@
 #   4. formosa-mcp 的 master 是乾淨的(orchestrator 開工前會 checkout + pull)
 
 repo:
-  path: C:/Users/t6362/Documents/formosa-mcp
+  # `~` 展開,所以同一份 config 在 Windows 與 mac 上都指得到
+  # (兩台的 repo 都在 `<家目錄>/Documents/formosa-mcp`)。
+  path: ~/Documents/formosa-mcp
   base_branch: master             # 不是預設的 main
   remote: origin
 
