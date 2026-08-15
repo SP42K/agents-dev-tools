@@ -338,14 +338,28 @@ Get-Content pipeline.log -Wait -Tail 50      # 隨時 attach 看即時輸出,ctr
 macOS / Linux(例如整條 pipeline 跑在另一台機器上、從本機 `ssh` 進去看):
 
 ```bash
-cd ~/Documents/agents-dev-tools
-nohup .venv/bin/python -m milestone_pipeline run --config target.yaml \
-  >> /tmp/pipeline.log 2>&1 &
-tail -f /tmp/pipeline.log                    # ctrl+c 離開不影響 pipeline
+ssh host 'cd ~/Documents/agents-dev-tools && \
+  nohup .venv/bin/python -m milestone_pipeline run --config target.yaml \
+    >> ~/pipeline.log 2>&1 < /dev/null & echo $! > ~/pipeline.pid'
+
+ssh host tail -n 50 ~/pipeline.log       # 隨時回來看,離開不影響 pipeline
+ssh host 'kill $(cat ~/pipeline.pid)'    # 中途叫停(§8)
 ```
 
-`ssh host 'nohup ... &'` 也可以 —— 連線斷掉 process 會活著。要能重新 attach
-互動就用 `tmux`。**注意 `notify.channels` 的 `desktop` 是寫死 PowerShell 的
+三個細節:**`< /dev/null` 不能省**(少了它 ssh 會等 stdin 而不返回);
+log **不要放 `/tmp`**(macOS 會清);PID 檔讓「merge 完就停」那招(§8)
+從任何一台機器都下得了手。
+
+**不需要 tmux。** orchestrator 從來不讀 stdin(park 是存檔 → 通知 → exit,
+刻意不 `input()` 等人,見 §6),所以「接上一個互動終端」在這裡是零收益 ——
+attach 就是讀那個 log,而 agent 的文字會即時落地(§5),離線期間發生的事一件不漏。
+
+**`session_id` 綁在跑它那台機器的 `~/.claude/projects/` 底下,不能跨機器 resume。**
+所以要換機器就在 milestone 之間換(前一個 merge 完、下一個還沒起跑),
+不要 milestone 跑到一半才搬 —— implementer 的 context 接不回去。
+`repo.path` 寫成 `~/Documents/...` 的話同一份 config 兩台都指得到,不必養兩份。
+
+**注意 `notify.channels` 的 `desktop` 是寫死 PowerShell 的
 (`notify.py`),在 mac / Linux 上會失敗** —— 通知失敗不會中斷 pipeline(只記 log),
 但等於沒有桌面通知,要留一條 `pr_comment` 或 `webhook`。
 

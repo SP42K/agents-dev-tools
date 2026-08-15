@@ -1,7 +1,20 @@
 # milestone-pipeline 設定:formosa-mcp(W3 起)
 #
-#   python -m milestone_pipeline status --config formosa.yaml
-#   python -m milestone_pipeline run    --config formosa.yaml
+# ** 這條 pipeline 跑在 mac 上(`ssh mac`),不是本機 Windows。**
+# M6 起搬過去的:兩台的環境都備齊了(python / node / gh / ocr / claude),
+# 但 implementer 的 session_id 綁在跑它那台的 ~/.claude/projects/ 底下,
+# **不能跨機器 resume** —— 所以起跑之後就固定在 mac 上跑完,不要兩邊交替。
+#
+#   ssh mac 'cd ~/Documents/agents-dev-tools && \
+#     nohup .venv/bin/python -m milestone_pipeline run --config formosa.yaml \
+#       >> ~/pipeline-formosa.log 2>&1 < /dev/null & echo $! > ~/pipeline-formosa.pid'
+#
+#   ssh mac tail -n 50 ~/pipeline-formosa.log          # 隨時回來看
+#   ssh mac 'kill $(cat ~/pipeline-formosa.pid)'       # 中途叫停(見 SKILL.md §8)
+#   ssh mac 'cd ~/Documents/agents-dev-tools && .venv/bin/python -m milestone_pipeline status --config formosa.yaml'
+#
+# `< /dev/null` 不能省:少了它 ssh 會等 stdin 而不返回。
+# 改完這個檔要先 push + 在 mac 上 pull,否則跑的是舊設定。
 #
 # 開跑前的前置條件(缺一個就會在半路才炸):
 #   1. .env 裡有 CWA_API_KEY / TDX_CLIENT_ID / TDX_CLIENT_SECRET
