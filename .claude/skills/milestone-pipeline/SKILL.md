@@ -177,6 +177,53 @@ notify:
 state_file: .pipeline-state.json
 ```
 
+### `reviewer.type`:三選一
+
+| 值 | 怎麼運作 | 什麼時候用 |
+|---|---|---|
+| `script` | 每輪開一個 fresh Claude session 讀 diff、跑測試、下 verdict | 預設,單機無人值守 |
+| `actions` | 輪詢 GitHub Actions 上跑的 review | review 已經跑在 CI 上 |
+| `hybrid` | 先用 `ocr delegate` **確定性地**算出「該審哪些檔、每個檔套哪組檢查項目」,再把這份清單交給 Claude 讀 diff / 跑測試 / 驗收驗收條件 / 下 verdict | 想讓 review 有一份不受 LLM 心情影響的覆蓋清單 |
+
+啟用 `hybrid` 只要兩步:
+
+```bash
+npm i -g @alibaba-group/open-code-review     # 提供 `ocr` 這支 CLI
+```
+
+```yaml
+reviewer:
+  type: hybrid
+  model: opus
+  # 下面全部可省略,列出來只是說明有哪些旋鈕
+  ocr_exe: ocr                 # 執行檔名稱或完整路徑
+  ocr_timeout_sec: 300
+  ocr_exclude: ""              # 逗號分隔的 gitignore 樣式
+  ocr_rule_path: ""            # 自訂規則 JSON
+  ocr_max_rule_chars: 40000    # 超過就截斷(prompt 會註明截斷了)
+```
+
+**不需要 OCR 自己的 LLM 金鑰。** 走的是 `delegate` 模式 —— 它標榜 `no LLM required`,
+只做檔案篩選與規則比對,判斷全部由 reviewer 的 Claude session 做。所以訂閱制的
+Claude 認證就跑得動,也不會有第二筆帳單。**不要改成 `ocr review`**,那個模式要它
+自己的 API key,訂閱制認證餵不進去。
+
+幾件要先知道的:
+
+- **它是輔助,不是關卡。** delegate 模式下 OCR 連程式碼都沒讀過,verdict 仍然只由
+  Claude 下。它給的規則開頭寫著 `Favor precision over recall` —— 那是它的取捨,
+  不是你的。`hybrid_review_prompt` 已經明講「檔案清單是**下限**、規則是**提醒**」。
+- **它不跑測試、不看 milestone 驗收條件**,而且會用 `unsupported_ext` 略過 `.md`
+  之類的檔案(prompt 會把那些點名回來)。所以 `hybrid` 不能取代 §7 的人工 merge gate。
+- **這一段是 fail-open**:沒裝、逾時、JSON 壞掉,都只記警告 + 把失敗原因寫進 prompt,
+  不 park。方向和 `VERDICT` 的 fail-closed 相反,理由同 `UNRESOLVED` ——
+  下游還有 `VERDICT` 擋著,若這裡也 fail-closed,一台沒裝 `ocr` 的機器會每輪都停。
+  **代價是「OCR 長期悄悄沒在跑」不會自己浮出來**,起飛時看一次 log 有沒有那行警告。
+
+> **還沒有實測數據。** 到目前為止(formosa milestone 1–3)跑的都是 `script`。
+> `hybrid` 值不值得,要實際跑一個 milestone 比對 review 的深度才知道 ——
+> 那還沒發生過。第一次用的人請把兩邊的 review 意見做個對照,補進這一節。
+
 ### 實測基準值(opus,中型 milestone)
 
 | 項目 | 實測 |
@@ -204,6 +251,8 @@ claude --version          # SDK 要靠它起 agent
 gh --version && gh auth status
 node --version            # 目標專案需要的話
 python -c "import claude_agent_sdk; print('sdk ok')"
+
+ocr --version            # 只有 reviewer.type: hybrid 需要
 ```
 
 **`gh` 一定要在 PATH 上。** orchestrator 的 `gh.py` 用
