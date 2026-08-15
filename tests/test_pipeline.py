@@ -523,3 +523,104 @@ def test_ocr_unavailable_note_names_the_reason():
     assert "逐一審過" in note
 
 
+# -- 決策狀態 ----------------------------------------------------------------
+
+def test_await_fields_survive_roundtrip(tmp_path):
+    st = PipelineState()
+    ms = st.ms(1)
+    ms.phase = PH_AWAIT_HUMAN
+    ms.await_reason = "merge_gate"
+    ms.await_payload = "reviewer 已 APPROVE"
+    ms.await_prev_phase = PH_MERGE
+    ms.merge_approved = False
+    st.save(tmp_path / "s.json")
+
+    back = PipelineState.load(tmp_path / "s.json").ms(1)
+    assert back.phase == PH_AWAIT_HUMAN
+    assert back.await_reason == "merge_gate"
+    assert back.await_prev_phase == PH_MERGE
+
+
+def test_old_savefile_without_await_fields_still_loads(tmp_path):
+    """加欄位必須給預設值,否則舊存檔會炸 —— 這是 state.py 的相容性約定。"""
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({
+        "current": 1,
+        "milestones": {"1": {"phase": "review", "pr_number": 3,
+                             "review_round": 2}},
+    }), encoding="utf-8")
+    ms = PipelineState.load(p).ms(1)
+    assert ms.pr_number == 3
+    assert ms.await_reason is None
+    assert ms.merge_approved is False
+    assert ms.human_feedback is None
+
+
+# -- 通知內容 ----------------------------------------------------------------
+
+def _decision(**over):
+    from milestone_pipeline.notify import R_MERGE_GATE, Decision
+    kw = dict(milestone_index=3, milestone_title="CWA 天氣",
+              reason=R_MERGE_GATE, detail="reviewer 已 APPROVE",
+              config_hint="my.yaml", pr_number=7,
+              pr_url="https://github.com/o/r/pull/7", cost_usd=12.5)
+    kw.update(over)
+    return Decision(**kw)
+
+
+def test_decision_body_carries_everything_needed_to_decide():
+    """通知要能讓人在手機上判斷:哪個 milestone、PR、為什麼停、怎麼恢復。"""
+    body = _decision().body(mention="@SP42K")
+    assert "Milestone 3" in body and "CWA 天氣" in body
+    assert "https://github.com/o/r/pull/7" in body
+    assert "@SP42K" in body
+    assert "$12.50" in body
+    assert "approve --milestone 3 --config my.yaml" in body
+    assert "reject --milestone 3" in body
+
+
+def test_decision_plain_has_no_markdown_fences():
+    plain = _decision().plain()
+    assert "```" not in plain
+    assert "Milestone 3" in plain
+
+
+def test_multi_notifier_swallows_channel_failures():
+    """通知失敗絕不能中斷 pipeline —— 狀態已經存檔了。"""
+    from milestone_pipeline.notify import MultiNotifier, Notifier
+
+    class Boom(Notifier):
+        def notify(self, decision):
+            raise RuntimeError("webhook 掛了")
+
+    seen = []
+
+    class Ok(Notifier):
+        def notify(self, decision):
+            seen.append(decision.milestone_index)
+
+    # 壞的排在前面,後面的仍要收到
+    MultiNotifier([Boom(), Ok()]).notify(_decision())
+    assert seen == [3]
+
+
+def test_webhook_payload_shapes():
+    from milestone_pipeline.notify import WebhookNotifier
+    d = _decision()
+    assert "content" in WebhookNotifier("u", "discord")._payload(d)
+    assert "text" in WebhookNotifier("u", "slack")._payload(d)
+    assert WebhookNotifier("u", "raw")._payload(d)["milestone"] == 3
+
+
+def test_discord_payload_is_truncated():
+    """Discord content 超過 2000 會 400,寧可截斷也不要整則掉。"""
+    from milestone_pipeline.notify import WebhookNotifier
+    d = _decision(detail="x" * 5000)
+    payload = WebhookNotifier("u", "discord")._payload(d)
+    assert len(payload["content"]) <= 1900
+
+
+def test_make_notifier_returns_null_when_no_channels(tmp_path):
+    from milestone_pipeline.config import NotifyCfg
+    from milestone_pipeline.notify import NullNotifier, make_notifier
+    assert isinstance(make_notifier(NotifyCfg(), tmp_path), NullNotifier)
