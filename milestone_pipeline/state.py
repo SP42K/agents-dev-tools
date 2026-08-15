@@ -25,6 +25,14 @@ class MilestoneState:
     branch: str | None = None
     session_id: str | None = None   # implementer 持久 session
     review_round: int = 0
+    # reviewer 是否**真的**完整掃過這個 PR 一次(`prompts._SCOPE_LOCK` 的前提)。
+    # 不能拿 `review_round > 1` 當代理:人工 `reject` 的那一輪會消耗輪數但跳過
+    # reviewer,於是 reviewer 一出場就是 round 2、一出場就被鎖範圍 —— 而「先前
+    # 的意見」指的是人的意見,涵蓋範圍通常比 implementer 實際改的東西窄很多。
+    # 不變式:**人已接手、PR 即將大幅改變時就要清掉這個旗標** —— 先前那次掃描
+    # 涵蓋不到接下來的東西。目前那等於 `retry` 與 `reject`(兩者也都會把
+    # review_round 歸零),但要清的理由是前者,不是「輪數歸零」這個表象。
+    reviewer_seen: bool = False
     # implementer 是「單一 session 的累計花費」(SDK 每次回傳都是累計值),
     # reviewer 是「每輪各自獨立」所以要自己加總。兩者語意不同,分開存。
     implementer_cost_usd: float = 0.0

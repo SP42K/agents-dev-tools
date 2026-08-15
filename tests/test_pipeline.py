@@ -565,6 +565,41 @@ def test_hybrid_prompt_frames_list_as_lower_bound():
     assert "不是收斂指令" in text
 
 
+def test_round_notes_keys_on_reviewer_seen_not_round_number():
+    """鎖範圍的前提是 reviewer 真的掃過,不是「輪數 > 1」。
+
+    人工 reject 會吃掉一輪卻跳過 reviewer,所以 round_no 不是合法的代理 ——
+    用它的話 reviewer 一出場就被鎖在「人的意見」那個範圍裡。
+    """
+    from milestone_pipeline.prompts import round_notes
+    assert round_notes(False, False) == ""
+    assert "這一輪的範圍" in round_notes(True, False)
+    assert "這是最後一輪" not in round_notes(True, False)
+    # 第五項 blocker:實測最有價值的發現都是這個形狀,fixtures 與 typecheck
+    # 都測不出來。少了它,_SCOPE_LOCK 會把它降級成沒人會做的「後續建議」。
+    assert "對外承諾與實際行為不符" in round_notes(True, False)
+    both = round_notes(True, True)
+    assert "這一輪的範圍" in both and "這是最後一輪" in both
+    # 最後一輪但 reviewer 還沒掃過(reject 後上限只剩一輪):不鎖範圍,只講最後一輪
+    only = round_notes(False, True)
+    assert "這一輪的範圍" not in only and "這是最後一輪" in only
+
+
+def test_review_prompts_carry_round_notes():
+    """兩個模板都要吃到收斂段落 —— 只改一個就等於 hybrid 模式沒有收斂機制。"""
+    from milestone_pipeline.prompts import hybrid_review_prompt, review_prompt
+    for text in (review_prompt(7, 3, "spec", reviewer_seen=True, is_final=True),
+                 hybrid_review_prompt(7, 3, "spec", "section",
+                                      reviewer_seen=True, is_final=True)):
+        assert "這一輪的範圍" in text
+        assert "這是最後一輪" in text
+    # 第 3 輪但 reviewer 沒掃過(reject 吃掉前兩輪)→ 一樣要拿到完整掃描
+    for text in (review_prompt(7, 3, "spec"),
+                 hybrid_review_prompt(7, 3, "spec", "section")):
+        assert "這一輪的範圍" not in text
+        assert "這是最後一輪" not in text
+
+
 def test_hybrid_scan_fails_open_on_bad_gh_json(tmp_path):
     """gh 輸出壞掉時要 fail-open。JSONDecodeError 繼承 ValueError 不是 RuntimeError,
     漏掉它 fail-open 就破功,整條 pipeline 會炸。"""
@@ -911,6 +946,30 @@ def _orchestrator(tmp_path, **over):
     from milestone_pipeline.orchestrator import Orchestrator
     (tmp_path / "plan.md").write_text("intro\n\n## M1\nbody\n", encoding="utf-8")
     return Orchestrator(_cfg(tmp_path, **over))
+
+
+def test_final_round_note_requires_a_human_merge_gate(tmp_path):
+    """`_FINAL_ROUND` 是「非 blocker 一律放行」,所以 merge_gate=auto 時不能講 ——
+    否則輪數用完會自動 merge,等於把 PH_STUCK 這道 fail-closed 換成 fail-open。"""
+    ms = MilestoneState(branch="m1")
+
+    orch = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "ask"})
+    m = orch.plan.milestones[0]
+    ms.review_round = 1
+    assert orch._is_final_round(m, ms) is False   # 還有下一輪
+    ms.review_round = 2
+    assert orch._is_final_round(m, ms) is True    # 輪數到頂 + 人還在把關
+
+    auto = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "auto"})
+    assert auto._is_final_round(auto.plan.milestones[0], ms) is False
+
+    # 第二種「人其實不在關卡上」:gate=ask 但這個 milestone 還沒進入 gate 範圍
+    late = _orchestrator(tmp_path, **{"loop.max_review_rounds": 2,
+                                      "loop.merge_gate": "ask",
+                                      "loop.merge_gate_from_milestone": 3})
+    assert late._is_final_round(late.plan.milestones[0], ms) is False
 
 
 def test_verify_gate_skips_when_unconfigured(tmp_path):

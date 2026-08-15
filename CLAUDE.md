@@ -61,6 +61,47 @@ property(不是 dataclass field,所以不會進存檔)。
 prompt 已指示改用 `gh pr comment` 並繼續;流程不依賴 PR 的 review 狀態,
 verdict 走 stdout 解析。
 
+**`max_review_rounds` 是安全網,不是收斂機制。** reviewer 每輪都是 fresh
+session,所以第 3 輪的 reviewer 會用全新的眼睛掃同一份 diff,自然挑出**另一組**
+nit —— PR 越來越好卻永遠不收斂,調高上限只是在餵這個迴圈。真正的收斂在
+`prompts.round_notes()`:reviewer 掃過一次之後插入 `_SCOPE_LOCK`(新發現只有 bug / 資安 /
+規格沒做到 / 測試沒過才能影響 VERDICT,其餘一律寫成「後續建議」),最後一輪
+再插入 `_FINAL_ROUND`(明講這輪 REQUEST_CHANGES 就會停下來等人,所以只擋
+blocker)。「第幾輪、是不是最後一輪」由 orchestrator 算好傳進去(`is_final`),
+agent 只負責判斷 —— 同 verify gate,不新增 phase / 狀態 / 契約。
+**兩個 review 模板都要吃到 `round_notes`**,只改一個等於 hybrid 模式沒有收斂
+機制。`ActionsReviewer` 收得到 `is_final` 但只能忽略(它的 prompt 在對方 repo
+的 workflow 裡)。
+
+blocker 清單的**第五項(對外承諾與實際行為不符:tool 描述、回應的 notes、
+錯誤訊息、使用者文件)不能拿掉**。實測(formosa M6)最有價值的三個發現都是
+這個形狀,而且 fixtures 測不出來、typecheck 也過,只有 reviewer 逐字對得出來。
+少了這項,`_SCOPE_LOCK` 會把它降級成「後續建議」——而寫在已 merge 的 PR 上的
+後續建議實務上等於沒人會做。
+
+**`_SCOPE_LOCK` 看 `ms.reviewer_seen`,不是 `round_no > 1`。** 輪數不是「reviewer
+掃過幾次」的代理:人工 `reject` 的那一輪會 `review_round += 1` 但**跳過 reviewer**
+(意見直接交給 implementer),所以 reviewer 一出場就是 round 2 —— 用輪數的話它
+一出場就被鎖在「人的意見」那個範圍裡,而 `reject` 的典型用法是「接續你被中斷的
+修復」,implementer 在那一輪往往改了遠超出人意見範圍的東西,這份 PR 於是**從頭到尾
+沒拿到過一次不受限的完整掃描**。不變式:**人已接手、PR 即將大幅改變時就要清掉
+`reviewer_seen`** —— 先前那次掃描涵蓋不到接下來的東西。目前那等於 `retry` 與
+`reject`(兩者也都會把 `review_round` 歸零),但**要清的理由是前者,不是「輪數
+歸零」這個表象** —— 拿輪數當代理,正是這一段一開始踩的那顆雷。
+旗標只在 reviewer 回傳且 `is_error` 為假之後才設 True;
+出錯那次可能只讀了半份 diff。退化方向是安全的:False 只是多一次完整掃描。
+(verify 失敗**不會**有這個問題 —— 它發生在 reviewer 已經跑過並 APPROVE 的**同一輪**
+內,只是換掉 `feedback`,不會多出一個沒有 reviewer 的輪次。)
+
+**`is_final` 綁著 `merge_gate`,不是單看輪數。** `_FINAL_ROUND` 的語意是
+「非 blocker 一律放行」,所以 `merge_gate: auto` 下它等於**輪數用完自動 merge**
+—— 把 `PH_STUCK` 這道 fail-closed 的安全網換成 fail-open,方向與 `VERDICT` 的
+doctrine 相反。因此 `is_final` 要同時滿足「輪數到頂」與
+`loop.needs_human_merge(m.index)`,`auto` 時照舊落到 `PH_STUCK` 等人。
+代價很小:`_FINAL_ROUND` 本來就只在最後一輪觸發,真正省輪數的是每輪都在的
+`_SCOPE_LOCK`。新增任何「放寬 reviewer 標準」的機制之前,先問**放寬之後誰還在
+把關**。
+
 **`UNRESOLVED` 是第二個 agent↔code 契約,但方向與 `VERDICT` 相反。**
 `fix_prompt` 要求 implementer 最後一行輸出 `UNRESOLVED: YES|NO`,表示它與
 reviewer 有沒有沒談攏的爭點;有的話 orchestrator 停下來讓人裁決。

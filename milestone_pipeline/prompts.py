@@ -129,13 +129,79 @@ _VERDICT_INSTRUCTION = """\
    並在 VERDICT 前面附上你留給 implementer 的完整意見全文。"""
 
 
-def review_prompt(pr_number: int, round_no: int, plan_excerpt: str) -> str:
+# -- 收斂約束 ---------------------------------------------------------------
+#
+# reviewer 每輪都是 fresh session(見 `reviewer.ScriptReviewer`),所以第 3 輪
+# 的 reviewer 會用全新的眼睛掃同一份 diff,自然挑出**另一組** nit ——
+# PR 越來越好但永遠不收斂。輪數上限只是安全網,不是收斂機制。
+#
+# 這兩段就是收斂機制:哪一輪該收到什麼程度由 **code** 決定(orchestrator 知道
+# `review_round` 與上限),agent 只負責判斷。刻意不新增 phase / 狀態 / 契約,
+# 樣板同 verify gate。
+#
+# blocker 清單的第五項(對外承諾與實際行為不符)不能拿掉。formosa M6 三個最有
+# 價值的發現都是這個形狀 —— tool 描述承諾了回傳裡沒有的欄位、回應的 notes 與
+# 同一份回應的數字相反、文件說免金鑰的清單漏列兩個。這類問題 fixtures 測不出來、
+# typecheck 也過,只有 reviewer 逐字對得出來;少了這項就會被降級成「後續建議」,
+# 等於把 reviewer 唯一不可取代的能力關掉。
+
+_SCOPE_LOCK = """\
+## 這一輪的範圍
+先前已經有一輪完整掃過這個 PR 並提出意見。你這一輪的主要工作是確認**先前提出
+的意見是否已經處理**。
+
+新發現的問題,只有符合以下之一才能影響 VERDICT:
+- 會產生錯誤行為(bug、邊界情況、資料損毀)
+- 資安問題
+- milestone 規格該做的沒做到
+- 測試 / lint / typecheck 沒過
+- 對外承諾與實際行為不符(tool 描述、回應裡的 notes、錯誤訊息、使用者文件,
+  說了程式其實沒做到的事)
+
+其餘的新發現(命名、風格、可以更漂亮的重構、未來才需要的擴充)一律寫成
+「後續建議」列在意見裡,**不要因此 REQUEST_CHANGES**。
+"""
+
+_FINAL_ROUND = """\
+## 這是最後一輪
+review 輪數上限到了,這一輪之後沒有再修的機會 —— 你如果 REQUEST_CHANGES,
+這個 milestone 會停下來等人工處理,而不是再跑一輪。
+
+所以這一輪只有 blocker 才 REQUEST_CHANGES(定義同上一節那五項)。
+其餘意見一律寫成「後續建議」留在 PR 上,然後 APPROVE。
+"""
+
+
+def round_notes(reviewer_seen: bool, is_final: bool) -> str:
+    """組出要插進 review prompt 的收斂段落。純函式,兩個模板共用。
+
+    兩個旗標都不是「第幾輪」的同義詞,呼叫端要算清楚才傳:
+
+    - `reviewer_seen`:reviewer **真的**完整掃過這個 PR 一次了。不能用
+      `round_no > 1` 代替 —— 人工 `reject` 的那一輪會吃掉輪數但跳過 reviewer,
+      於是 reviewer 一出場就是 round 2,一出場就被鎖在「人的意見」那個範圍裡,
+      而 implementer 在那一輪往往改了遠超出人意見範圍的東西。
+    - `is_final`:這是最後一輪**而且後面還有人**(merge gate 會攔)。
+
+    沒掃過就不鎖範圍 —— 每個 PR 至少要拿到一次不受限的完整掃描。
+    """
+    parts = []
+    if reviewer_seen:
+        parts.append(_SCOPE_LOCK)
+    if is_final:
+        parts.append(_FINAL_ROUND)
+    return "\n".join(parts)
+
+
+def review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
+                  reviewer_seen: bool = False, is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
+{round_notes(reviewer_seen, is_final)}
 ## 步驟
 1. `gh pr view {pr_number}` 看描述,`gh pr diff {pr_number}` 看完整 diff;
    第 2 輪以後也要看先前的 review 討論串,確認前幾輪意見是否已處理。
@@ -219,13 +285,15 @@ def ocr_unavailable_note(reason: str) -> str:
 
 
 def hybrid_review_prompt(pr_number: int, round_no: int, plan_excerpt: str,
-                         ocr_section: str) -> str:
+                         ocr_section: str, reviewer_seen: bool = False,
+                         is_final: bool = False) -> str:
     return f"""\
 # 任務:Review PR #{pr_number}(第 {round_no} 輪)
 
 這個 PR 對應的 milestone 規格:
 {plan_excerpt}
 
+{round_notes(reviewer_seen, is_final)}
 ## 審查範圍與檢查項目(open-code-review 委託模式)
 {ocr_section}
 
