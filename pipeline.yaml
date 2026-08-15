@@ -56,10 +56,23 @@ loop:
   gate_on_agent_error: true       # agent 超預算/超輪數/API 失敗時停下來問人,
                                   # 而不是直接中止(session 保留,加額度後可續跑)
 
+  # -- 確定性驗收關卡 ----------------------------------------------------
+  # reviewer APPROVE 之後、merge 之前跑的命令(在目標 repo 的 PR 分支上)。
+  # reviewer 的 VERDICT 是 LLM 的判斷,這一道是 code 驗出來的事實。
+  # 走 shell,所以 `pytest && ruff check .` 這種寫法可以。
+  # 空字串 = 不跑(預設,維持沒有這個功能時的行為)。
+  # 失敗時把輸出當成這一輪的意見交回 implementer,共用 max_review_rounds,
+  # 輪數用完就落到既有的 stuck —— 不會無限重試。
+  verify_command: ""              # 例如:pytest -q
+  verify_timeout_sec: 900
+
 notify:
   channels: []                    # pr_comment | webhook | desktop,可多選;空 = 不通知
   mention: ""                     # 例如 "@SP42K",放在通知開頭觸發 GitHub 推播
   webhook_url: ""                 # Discord / Slack incoming webhook(選 webhook 時必填)
   webhook_format: discord         # discord | slack | raw
+
+backend: claude                   # 兩個 agent 跑在哪個 runtime 上(見 backend.py)。
+                                  # 目前只有 claude 一種,這行不寫也是它。
 
 state_file: .pipeline-state.json  # 進度存檔(相對 repo path),crash 後可 resume

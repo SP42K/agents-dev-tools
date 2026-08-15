@@ -1,15 +1,25 @@
 """不需要 SDK / gh / 網路的純邏輯測試。"""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import subprocess
 
 import pytest
 import yaml
 
-from milestone_pipeline.config import Config, LoopCfg
+from milestone_pipeline.backend import AgentBackend, AgentSession
+from milestone_pipeline.config import AgentCfg, Config, LoopCfg, ReviewerCfg
+from milestone_pipeline.implementer import IMPLEMENTER_TOOLS, Implementer
 from milestone_pipeline.plan import Plan
+from milestone_pipeline.prompts import verify_fail_prompt
+from milestone_pipeline.reviewer import REVIEWER_TOOLS, ScriptReviewer
+from milestone_pipeline.runner import AgentResult
 from milestone_pipeline.state import (PH_AWAIT_HUMAN, PH_MERGE, MilestoneState,
                                       PipelineState)
+from milestone_pipeline.verify import (fingerprint, run_verify,
+                                       workspace_fingerprint)
 
 
 # -- plan 解析 ---------------------------------------------------------------
@@ -689,3 +699,274 @@ def test_agent_crash_detail_truncates_giant_exceptions():
     from milestone_pipeline.orchestrator import agent_crash_detail
     detail = agent_crash_detail("實作", RuntimeError("x" * 10_000))
     assert detail.count("x") == 2000
+
+
+# -- verify gate(確定性驗收關卡)---------------------------------------------
+
+def test_config_verify_defaults(tmp_path):
+    """沒設就是不跑 —— 舊的 pipeline.yaml / formosa.yaml 不改也要能跑。"""
+    cfg = _cfg(tmp_path)
+    assert cfg.loop.verify_command == ""
+    assert cfg.loop.verify_timeout_sec == 900
+
+
+def test_config_reads_verify_overrides(tmp_path):
+    cfg = _cfg(tmp_path, **{"loop.verify_command": "pytest && ruff check .",
+                            "loop.verify_timeout_sec": 120})
+    assert cfg.loop.verify_command == "pytest && ruff check ."
+    assert cfg.loop.verify_timeout_sec == 120
+
+
+def test_verify_skipped_when_no_command(tmp_path):
+    """skipped 時 ok 也是 True —— 呼叫端只要看 .ok。"""
+    r = run_verify("   ", tmp_path)
+    assert (r.ok, r.skipped) == (True, True)
+
+
+def test_verify_success(tmp_path):
+    r = run_verify('python -c "print(\'ok\')"', tmp_path, timeout_sec=60)
+    assert r.ok is True
+    assert r.skipped is False
+    assert "ok" in r.output
+
+
+def test_verify_failure_is_not_ok(tmp_path):
+    # Windows 上 `false` 不存在,用 python 比較保險
+    r = run_verify('python -c "raise SystemExit(1)"', tmp_path, timeout_sec=60)
+    assert r.ok is False
+    assert r.returncode == 1
+
+
+def test_verify_shell_chaining_short_circuits(tmp_path):
+    """shell=True 是刻意的:使用者要能寫 `a && b`。"""
+    r = run_verify('python -c "raise SystemExit(1)" && python -c "print(1)"',
+                   tmp_path, timeout_sec=60)
+    assert r.ok is False
+
+
+def test_verify_truncates_output_from_the_tail(tmp_path):
+    """錯誤訊息通常在最後,而且靜默截斷會讓 implementer 以為拿到全文。"""
+    r = run_verify(
+        'python -c "print(\'a\'*200 + \'TAIL_MARKER\')"',
+        tmp_path, timeout_sec=60, max_output_chars=50)
+    assert "TAIL_MARKER" in r.output
+    assert "截斷" in r.output
+    assert len(r.output) < 200
+
+
+def test_verify_fail_prompt_names_the_command_and_output():
+    text = verify_fail_prompt("pytest -q", "E   assert 1 == 2")
+    assert "pytest -q" in text
+    assert "assert 1 == 2" in text
+    # 一定要講清楚這不是 reviewer 說的,否則 implementer 會去 PR 上找對應意見
+    assert "reviewer" in text
+    # 不新增契約:UNRESOLVED 仍由 fix_prompt 負責,這裡不該自己要求
+    assert "UNRESOLVED" not in text
+
+
+# -- workspace 指紋(沒變就不重跑失敗的 gate)---------------------------------
+
+def test_fingerprint_is_stable_and_changes_with_any_part():
+    base = fingerprint("head", "status", "diff")
+    assert base == fingerprint("head", "status", "diff")
+    assert base != fingerprint("head2", "status", "diff")
+    assert base != fingerprint("head", "status2", "diff")
+    assert base != fingerprint("head", "status", "diff2")
+
+
+def test_fingerprint_does_not_collide_on_boundary_shifts():
+    """分隔字元不能是可能出現在 git 輸出裡的東西,否則兩段的邊界會糊掉。"""
+    assert fingerprint("ab", "c") != fingerprint("a", "bc")
+
+
+def test_workspace_fingerprint_returns_empty_outside_git_repo(tmp_path):
+    """取不到就回空字串 → 呼叫端照跑驗收(退化方向安全)。"""
+    assert workspace_fingerprint(tmp_path) == ""
+
+
+# -- AgentBackend 介面 --------------------------------------------------------
+
+def test_config_backend_defaults_to_claude(tmp_path):
+    assert _cfg(tmp_path).backend == "claude"
+
+
+def test_config_rejects_unknown_backend(tmp_path):
+    raw = {
+        "repo": {"path": str(tmp_path)},
+        "plan": {"path": "plan.md"},
+        "implementer": {"model": "fable"},
+        "reviewer": {"model": "opus"},
+        "backend": "prime-agent",
+    }
+    p = tmp_path / "pipeline.yaml"
+    p.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        Config.load(p)
+
+
+class _FakeSession(AgentSession):
+    """假的**自家介面**,不是 SDK 型別 —— 所以沒有違反「不 mock SDK」。"""
+
+    def __init__(self, spec, resume_session_id=None):
+        self.spec = spec
+        self.session_id = resume_session_id
+        self.prompts: list[str] = []
+        self.compacted = 0
+        self.echoed: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def ask(self, prompt, on_text=None):
+        self.prompts.append(prompt)
+        if on_text is not None:
+            on_text("agent 說話了")
+            self.echoed.append("agent 說話了")
+        # AgentSession 的契約:回報的新 session_id 要記在 session 上
+        self.session_id = "sess-新"
+        return AgentResult(text="做完了", session_id="sess-新", cost_usd=1.5)
+
+    async def compact(self):
+        self.compacted += 1
+
+
+class _FakeBackend(AgentBackend):
+    def __init__(self):
+        self.last: _FakeSession | None = None
+
+    def session(self, spec, resume_session_id=None):
+        self.last = _FakeSession(spec, resume_session_id)
+        return self.last
+
+    async def query_once(self, spec, prompt, on_text=None):
+        return AgentResult(text="VERDICT: APPROVE")
+
+
+def _implementer(tmp_path, backend, resume=None):
+    return Implementer(AgentCfg(model="fable"), tmp_path, backend,
+                       resume_session_id=resume)
+
+
+def test_implementer_runs_against_a_fake_backend(tmp_path):
+    backend = _FakeBackend()
+
+    async def go():
+        async with _implementer(tmp_path, backend, resume="sess-舊") as imp:
+            assert imp.session_id == "sess-舊"       # resume 先接上
+            result = await imp.ask("實作 milestone 1")
+            await imp.compact()
+            return result, imp.session_id
+
+    result, session_id = asyncio.run(go())
+    assert result.text == "做完了"
+    assert result.cost_usd == 1.5
+    # Implementer.session_id 必須是**轉發** session 的值,不能自己 cache 一份
+    # ——快取的話 orchestrator 存進 state 的會是舊的,crash 後 resume 接錯 session
+    assert session_id == "sess-新"
+    assert backend.last.prompts == ["實作 milestone 1"]
+    assert backend.last.compacted == 1
+    # ask 要接 on_text(即時輸出),compact 刻意不接(是雜訊)
+    assert backend.last.echoed == ["agent 說話了"]
+
+
+def test_implementer_spec_carries_the_tool_whitelist(tmp_path):
+    """`tools` 才是白名單。清單經由 AgentSpec 傳給 backend,不能在路上掉了。"""
+    backend = _FakeBackend()
+    _implementer(tmp_path, backend)
+    assert backend.last.spec.tools == IMPLEMENTER_TOOLS
+    assert backend.last.spec.system_prompt.startswith("你是這個 repo 的 implementer")
+
+
+def test_script_reviewer_uses_the_injected_backend(tmp_path):
+    rev = ScriptReviewer(ReviewerCfg(model="opus"), tmp_path, _FakeBackend())
+    out = asyncio.run(rev.review(7, 1, "## M1"))
+    assert out.approved is True
+    # reviewer 的 spec 不能帶 Edit/Write
+    assert rev.spec.tools == REVIEWER_TOOLS
+
+
+# -- verify gate 在 orchestrator 裡的接線(含指紋快取)-------------------------
+
+def _git_repo(path):
+    """在 tmp_path 起一個真的 git repo。不碰網路 / gh / SDK。"""
+    for argv in (["git", "init", "-b", "m1"],
+                 ["git", "config", "user.email", "t@example.com"],
+                 ["git", "config", "user.name", "t"],
+                 ["git", "add", "-A"],
+                 ["git", "commit", "-m", "init", "--no-gpg-sign"]):
+        subprocess.run(argv, cwd=path, check=True, capture_output=True)
+
+
+def _orchestrator(tmp_path, **over):
+    from milestone_pipeline.orchestrator import Orchestrator
+    (tmp_path / "plan.md").write_text("intro\n\n## M1\nbody\n", encoding="utf-8")
+    return Orchestrator(_cfg(tmp_path, **over))
+
+
+def test_verify_gate_skips_when_unconfigured(tmp_path):
+    orch = _orchestrator(tmp_path)
+    ms = MilestoneState(branch="m1")
+    # 沒設命令就不該碰 git,所以連 repo 都不用是 git repo
+    r = orch._verify(orch.plan.milestones[0], ms)
+    assert (r.ok, r.skipped) == (True, True)
+
+
+def test_verify_gate_reuses_output_until_the_workspace_changes(tmp_path, caplog):
+    marker = tmp_path.parent / "verify-runs.txt"   # 放 repo 外,免得自己改變指紋
+    marker.unlink(missing_ok=True)
+    cmd = (f'python -c "open(r\'{marker}\',\'a\').write(\'x\'); '
+           'print(\'boom\'); raise SystemExit(1)"')
+    orch = _orchestrator(tmp_path, **{"loop.verify_command": cmd})
+    _git_repo(tmp_path)
+    m, ms = orch.plan.milestones[0], MilestoneState(branch="m1")
+
+    first = orch._verify(m, ms)
+    assert first.ok is False
+    assert "boom" in first.output
+    assert marker.read_text() == "x"
+    assert ms.last_verify_fingerprint                      # 失敗才存指紋
+
+    # 第二輪 implementer 什麼都沒改 → 不重跑,沿用輸出,並記警告
+    with caplog.at_level(logging.WARNING, logger="pipeline"):
+        second = orch._verify(m, ms)
+    assert second.ok is False
+    assert second.output == first.output
+    assert marker.read_text() == "x"                       # 命令沒有再跑一次
+    assert any("沒有變動" in r.getMessage() for r in caplog.records)
+
+    # workspace 一變動就要重跑
+    (tmp_path / "new.py").write_text("x", encoding="utf-8")
+    assert orch._verify(m, ms).ok is False
+    assert marker.read_text() == "xx"
+
+
+def test_verify_gate_clears_the_cache_after_a_pass(tmp_path):
+    orch = _orchestrator(tmp_path, **{"loop.verify_command": "python -c pass"})
+    _git_repo(tmp_path)
+    ms = MilestoneState(branch="m1",
+                        last_verify_fingerprint="舊", last_verify_output="舊輸出")
+    assert orch._verify(orch.plan.milestones[0], ms).ok is True
+    # 沒清掉的話,下個 milestone 的第一次失敗會被誤判成「沒動作」
+    assert ms.last_verify_fingerprint is None
+    assert ms.last_verify_output is None
+
+
+def test_workspace_fingerprint_can_ignore_our_own_artifacts(tmp_path):
+    """state 檔每輪都被 _save() 改寫,不排掉的話「沒變動就不重跑」永遠不會生效。"""
+    from milestone_pipeline.verify import workspace_fingerprint as fp_of
+    (tmp_path / "seed.txt").write_text("x", encoding="utf-8")   # 要有東西才 commit 得起來
+    _git_repo(tmp_path)
+    state = tmp_path / ".pipeline-state.json"
+
+    state.write_text("{}", encoding="utf-8")
+    before = fp_of(tmp_path, ignore=[".pipeline-state.json"])
+    state.write_text('{"current": 2}', encoding="utf-8")
+    assert fp_of(tmp_path, ignore=[".pipeline-state.json"]) == before
+    assert fp_of(tmp_path) != before          # 不排除的話就會被它帶著跑
+
+    # 真的 code 變動仍然要看得到
+    (tmp_path / "app.py").write_text("x", encoding="utf-8")
+    assert fp_of(tmp_path, ignore=[".pipeline-state.json"]) != before

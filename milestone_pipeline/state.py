@@ -44,6 +44,11 @@ class MilestoneState:
     # 人已放行過 merge。沒有這個旗標,approve 之後 merge gate 會再次觸發,
     # 變成 park → approve → park 的無限迴圈。
     merge_approved: bool = False
+    # 上次驗收**失敗**時的 workspace 指紋與輸出(成功時清掉,所以「有指紋」
+    # 就等於「上次失敗過」)。implementer 那輪什麼都沒改時不重跑驗收命令,
+    # 直接沿用輸出 —— 順便讓「迴圈沒有前進」看得見。見 orchestrator._verify。
+    last_verify_fingerprint: str | None = None
+    last_verify_output: str | None = None
 
     @property
     def cost_usd(self) -> float:

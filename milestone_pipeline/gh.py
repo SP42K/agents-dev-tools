@@ -28,6 +28,12 @@ class Gh:
         self._run("git", "checkout", base)
         self._run("git", "pull", remote, base)
 
+    def checkout(self, branch: str) -> None:
+        """切到指定分支。驗收命令必須跑在 PR 的分支上,而 checkout_base 只在
+        PH_IMPLEMENT 開頭跑過 —— crash 後從 PH_REVIEW resume 時 repo 可能
+        停在任何分支。"""
+        self._run("git", "checkout", branch)
+
     # -- gh ------------------------------------------------------------------
 
     def find_pr(self, branch: str) -> int | None:
