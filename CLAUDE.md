@@ -52,6 +52,9 @@ property(不是 dataclass field,所以不會進存檔)。
 `reviewer._VERDICT_RE` 只認**自成一行**的形式並取最後一個。改其中一邊
 一定要同步改另一邊,並更新 `test_parse_verdict*`。解析不到時保守回
 `False`(視為要求修改),這是刻意的 —— 不要改成 fail-open。
+現在有兩個模板要對這個 regex 負責(`review_prompt` 與 `hybrid_review_prompt`),
+所以結尾那段文字抽成 `prompts._VERDICT_INSTRUCTION` 共用;新增模板請沿用它,
+不要各寫一份。
 
 **reviewer 無法 approve 自己帳號開的 PR。** implementer 與 reviewer 共用
 同一組 `gh` 認證,GitHub 會回 `Can not approve your own pull request`。
@@ -67,6 +70,33 @@ reviewer 有沒有沒談攏的爭點;有的話 orchestrator 停下來讓人裁�
 `has_unresolved_marker()` 分辨「沒說」與「說了 NO」並記警告。
 契約的模板與 regex **都在 `prompts.py`**(有別於 `VERDICT` 散在兩個模組),
 新增契約請沿用這個作法。
+
+**`reviewer.type: hybrid` 只能用 `ocr delegate`,不要改成 `ocr review`。**
+`ocr`(alibaba/open-code-review)有兩種模式,差別是誰出 LLM:`ocr review`
+要它自己的 API key(`OCR_LLM_*` / `ANTHROPIC_BASE_URL` 那組),**訂閱制的
+Claude 認證餵不進去**;`ocr delegate` 標榜 `no LLM required`,只做確定性的
+檔案篩選與規則比對,判斷全部由宿主 agent(這裡就是 reviewer 的 Claude
+session)做。走 delegate 才能只靠一組 Claude 認證跑完,也不會有第二筆帳單。
+
+**OCR 是輔助,不是關卡。** delegate 模式下它連程式碼都沒讀過,產出只有
+「該審哪些檔」+「每個檔套哪組檢查項目」,verdict 仍然只由 Claude 下。
+它給的規則開頭寫著 `Favor precision over recall`,那是它自己的取捨;
+`hybrid_review_prompt` 必須明講**檔案清單是下限、規則是提醒**,否則
+reviewer 會跟著收斂,而它是 merge 前唯一的關卡。它也**不跑測試、不看
+milestone 驗收條件**,還會用 `unsupported_ext` 略過 `.md` 等檔案 ——
+被略過的檔仍在 diff 裡,prompt 一定要把它們點名回來。
+
+**這段刻意 fail-open,方向與 `VERDICT` 相反。** OCR 沒裝、逾時、JSON 壞掉,
+`HybridReviewer._scan()` 一律**只記警告並把失敗原因寫進 prompt**,不設
+`is_error`、不 park —— 理由同 `UNRESOLVED`:下游還有 `VERDICT` 這道
+fail-closed 關卡,若這裡 fail-closed,一台沒裝 `ocr` 的機器會每輪 review 都
+停下來等人。失敗原因**必須**同時進 log 與 prompt
+(`prompts.ocr_unavailable_note`),不然「OCR 長期悄悄沒在跑」不會有人發現。
+同理,`format_review_plan` 的規則截斷也一定要在文字裡註明。
+
+**Windows 上呼叫 npm 裝的 CLI 一定要先 `shutil.which()`。** npm 裝出來的是
+`ocr.CMD`,而 `subprocess` 不做 PATHEXT 解析,直接傳 `"ocr"` 會
+`FileNotFoundError` —— 明明 shell 裡跑得動。見 `ocr.Ocr._resolve_exe()`。
 
 **merge gate 一定要配 `merge_approved` 旗標。** `approve` 之後 phase 回到
 `PH_MERGE`,如果不記「人已放行過」,`needs_human_merge()` 會再次成立 →
@@ -84,7 +114,8 @@ park → approve → park 無限迴圈。任何新增的關卡都要想清楚「
 
 - 註解與 docstring 用繁體中文,識別字用英文。
 - 每個模組單一職責:`config`(載入+驗證)、`plan`(解析)、`state`(存檔)、
-  `gh`(subprocess 封裝)、`prompts`(所有模板)、`runner`(SDK 回應收集)、
+  `gh` / `ocr`(各自一個外部 CLI 的 subprocess 封裝)、`prompts`(所有模板)、
+  `runner`(SDK 回應收集)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
   `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。

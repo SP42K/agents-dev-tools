@@ -318,6 +318,256 @@ def test_config_accepts_single_channel_as_string(tmp_path):
     assert cfg.notify.channels == ["pr_comment"]
 
 
+# -- hybrid reviewer:open-code-review 委託模式 -------------------------------
+
+def test_config_accepts_hybrid_and_ocr_defaults(tmp_path):
+    """舊 config(沒有任何 ocr_* 欄位)要拿得到可用的預設值。"""
+    cfg = _cfg(tmp_path, **{"reviewer.type": "hybrid"})
+    assert cfg.reviewer.type == "hybrid"
+    assert cfg.reviewer.ocr_exe == "ocr"
+    assert cfg.reviewer.ocr_timeout_sec == 300
+    assert cfg.reviewer.ocr_exclude == ""
+    assert cfg.reviewer.ocr_max_rule_chars == 40000
+
+
+def test_config_reads_ocr_overrides(tmp_path):
+    cfg = _cfg(tmp_path, **{
+        "reviewer.type": "hybrid",
+        "reviewer.ocr_exclude": "dist/,**/*.min.js",
+        "reviewer.ocr_max_rule_chars": 1000,
+    })
+    assert cfg.reviewer.ocr_exclude == "dist/,**/*.min.js"
+    assert cfg.reviewer.ocr_max_rule_chars == 1000
+
+
+def _ocr(tmp_path):
+    from milestone_pipeline.ocr import Ocr
+    return Ocr(tmp_path)
+
+
+def test_ocr_uses_delegate_not_review(tmp_path):
+    """委託模式是刻意的:`ocr review` 要自己的 LLM 金鑰,delegate 不用。"""
+    o = _ocr(tmp_path)
+    assert o.preview_argv("main", "x")[1:3] == ["delegate", "preview"]
+    assert o.rule_argv(["a.py"], "main", "x")[1:3] == ["delegate", "rule"]
+    for argv in (o.preview_argv("main", "x"), o.rule_argv(["a.py"], "main", "x")):
+        assert argv[argv.index("--format") + 1] == "json"
+        assert argv[argv.index("--from") + 1] == "main"
+        assert argv[argv.index("--to") + 1] == "x"
+
+
+def test_ocr_rule_argv_puts_paths_last(tmp_path):
+    """`delegate rule` 的路徑是位置參數,必須排在所有旗標之後。"""
+    argv = _ocr(tmp_path).rule_argv(["a.py", "b/c.go"], "main", "x",
+                                    rule_path="r.json")
+    assert argv[-2:] == ["a.py", "b/c.go"]
+    assert argv[argv.index("--rule") + 1] == "r.json"
+
+
+def test_ocr_argv_uses_single_comma_separated_exclude(tmp_path):
+    """`--exclude` 吃單一逗號字串,不是重複傳多次。"""
+    argv = _ocr(tmp_path).preview_argv("main", "x", exclude="dist/,**/*.min.js")
+    assert argv.count("--exclude") == 1
+    assert argv[argv.index("--exclude") + 1] == "dist/,**/*.min.js"
+
+
+def test_ocr_argv_omits_empty_optionals(tmp_path):
+    argv = _ocr(tmp_path).preview_argv("main", "x", exclude="", rule_path=None)
+    assert "--exclude" not in argv and "--rule" not in argv
+
+
+def test_ocr_batches_paths_under_argv_budget():
+    """40+ 檔的 milestone 不能一次塞進 argv,Windows 命令列有長度上限。"""
+    from milestone_pipeline.ocr import Ocr
+    paths = [f"pkg/module_{i:03d}.py" for i in range(40)]
+    batches = Ocr.batch_paths(paths, budget=100)
+    assert sum(batches, []) == paths          # 不漏、不重排
+    assert all(sum(len(p) + 1 for p in b) <= 100 for b in batches[:-1])
+    assert len(batches) > 1
+
+
+def test_ocr_batch_keeps_oversized_path_rather_than_dropping_it():
+    """單一路徑就超過預算時仍自成一批,寧可讓 subprocess 報錯也不要靜默丟檔。"""
+    from milestone_pipeline.ocr import Ocr
+    assert Ocr.batch_paths(["x" * 50], budget=10) == [["x" * 50]]
+
+
+def test_ocr_resolves_windows_shim_and_falls_back(tmp_path):
+    """npm 在 Windows 裝出來的是 ocr.CMD,subprocess 不做 PATHEXT 解析。"""
+    import shutil
+    from milestone_pipeline.ocr import Ocr
+    # 解不到時原樣退回,讓 subprocess 自己丟 FileNotFoundError
+    assert Ocr(tmp_path, exe="definitely-not-a-real-exe")._resolve_exe() \
+        == "definitely-not-a-real-exe"
+    # 解得到時要拿到 which 給的完整路徑(用一定存在的 python 當代理)
+    assert Ocr(tmp_path, exe="python")._resolve_exe() == shutil.which("python")
+
+
+# `ocr delegate preview --format json` 的實際輸出(v1.9.4,已精簡)
+_PREVIEW_JSON = json.dumps({
+    "schema_version": "1", "mode": "range", "merge_base": "b1dccac84a90",
+    "total_files": 3, "reviewable_count": 2, "excluded_count": 1,
+    "total_insertions": 472, "total_deletions": 7,
+    "reviewable_files": [
+        {"path": "milestone_pipeline/runner.py", "status": "modified",
+         "insertions": 13, "deletions": 3},
+        {"path": "formosa.yaml", "status": "modified",
+         "insertions": 14, "deletions": 4},
+    ],
+    "excluded_files": [
+        {"path": "docs/SKILL.md", "status": "added", "insertions": 356,
+         "deletions": 0, "exclude_reason": "unsupported_ext"},
+    ],
+})
+
+_RULE_JSON = json.dumps({
+    "schema_version": "1",
+    "groups": [{"group_id": 1, "source": "system", "pattern": "**/*.py",
+                "files": ["milestone_pipeline/runner.py"],
+                "rule": "#### Mutable Default Arguments\n- def f(x=[]) 很危險"}],
+})
+
+
+def test_ocr_parse_preview_maps_files_and_merge_base():
+    from milestone_pipeline.ocr import Ocr
+    plan = Ocr.parse_preview(_PREVIEW_JSON)
+    assert plan.merge_base == "b1dccac84a90"
+    assert plan.paths == ["milestone_pipeline/runner.py", "formosa.yaml"]
+    assert plan.excluded[0]["exclude_reason"] == "unsupported_ext"
+    assert (plan.total_insertions, plan.total_deletions) == (472, 7)
+
+
+def test_ocr_parse_rules_maps_groups():
+    from milestone_pipeline.ocr import Ocr
+    groups = Ocr.parse_rules(_RULE_JSON)
+    assert len(groups) == 1
+    assert groups[0].pattern == "**/*.py"
+    assert groups[0].files == ["milestone_pipeline/runner.py"]
+    assert "Mutable Default" in groups[0].rule
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "not json", "[]", '{"groups": []}'])
+def test_ocr_parse_preview_rejects_malformed(raw):
+    from milestone_pipeline.ocr import Ocr, OcrError
+    with pytest.raises(OcrError):
+        Ocr.parse_preview(raw)
+
+
+@pytest.mark.parametrize("raw", ["", "nope", "[]", '{"reviewable_files": []}'])
+def test_ocr_parse_rules_rejects_malformed(raw):
+    from milestone_pipeline.ocr import Ocr, OcrError
+    with pytest.raises(OcrError):
+        Ocr.parse_rules(raw)
+
+
+def _plan_and_groups():
+    from milestone_pipeline.ocr import Ocr
+    return Ocr.parse_preview(_PREVIEW_JSON), Ocr.parse_rules(_RULE_JSON)
+
+
+def test_format_review_plan_lists_every_reviewable_file():
+    from milestone_pipeline.prompts import format_review_plan
+    text = format_review_plan(*_plan_and_groups())
+    assert "milestone_pipeline/runner.py" in text
+    assert "formosa.yaml" in text
+    assert "b1dccac84a90" in text
+
+
+def test_format_review_plan_keeps_excluded_files_in_scope():
+    """OCR 略過的檔仍在 diff 裡,不點名 reviewer 就會跟著漏掉。"""
+    from milestone_pipeline.prompts import format_review_plan
+    text = format_review_plan(*_plan_and_groups())
+    assert "docs/SKILL.md" in text
+    assert "unsupported_ext" in text
+    assert "仍然要你自己看" in text
+
+
+def test_format_review_plan_includes_rule_text():
+    from milestone_pipeline.prompts import format_review_plan
+    text = format_review_plan(*_plan_and_groups())
+    assert "**/*.py" in text
+    assert "Mutable Default" in text
+
+
+def test_format_review_plan_announces_truncation():
+    """靜默截斷會讓 reviewer 以為拿到了完整清單。"""
+    from milestone_pipeline.prompts import format_review_plan
+    plan, groups = _plan_and_groups()
+    text = format_review_plan(plan, groups, max_rule_chars=20)
+    assert "截斷" in text
+
+
+def test_format_review_plan_never_truncates_the_file_lists():
+    """截斷只能吃規則段。檔案清單是覆蓋範圍的下限,截掉就等於默許漏審。"""
+    from milestone_pipeline.ocr import ReviewPlan, RuleGroup
+    from milestone_pipeline.prompts import format_review_plan
+    plan = ReviewPlan(
+        merge_base="abc123def456",
+        reviewable=[{"path": f"src/f{i}.py", "status": "modified",
+                     "insertions": 5, "deletions": 1} for i in range(40)],
+        excluded=[{"path": "docs/README.md", "exclude_reason": "unsupported_ext"}])
+    groups = [RuleGroup(pattern="**/*.py", files=["src/f0.py"], rule="X" * 7000)]
+    # 上限刻意設得比檔案清單本身還小
+    text = format_review_plan(plan, groups, max_rule_chars=10)
+    assert "src/f39.py" in text          # 最後一個待審檔仍在
+    assert "docs/README.md" in text      # 被略過的檔仍被點名
+    assert "仍然要你自己看" in text
+    assert "截斷" in text
+
+
+def test_format_review_plan_handles_empty_diff():
+    from milestone_pipeline.ocr import ReviewPlan
+    from milestone_pipeline.prompts import format_review_plan
+    text = format_review_plan(ReviewPlan(), [])
+    assert text.strip()
+    assert "沒有可審的檔案" in text
+
+
+def test_hybrid_prompt_satisfies_verdict_contract():
+    """hybrid 模板與 review 模板要對同一個 _VERDICT_RE 負責。"""
+    from milestone_pipeline.reviewer import _VERDICT_RE
+    from milestone_pipeline.prompts import hybrid_review_prompt, review_prompt
+    for text in (review_prompt(7, 1, "spec"),
+                 hybrid_review_prompt(7, 1, "spec", "section")):
+        assert _VERDICT_RE.findall(text) == ["APPROVE", "REQUEST_CHANGES"]
+
+
+def test_hybrid_prompt_carries_plan_and_section():
+    from milestone_pipeline.prompts import hybrid_review_prompt
+    text = hybrid_review_prompt(7, 2, "MILESTONE-SPEC", "OCR-SECTION")
+    assert "MILESTONE-SPEC" in text
+    assert "OCR-SECTION" in text
+    assert "#7" in text and "第 2 輪" in text
+
+
+def test_hybrid_prompt_frames_list_as_lower_bound():
+    """檔案清單是下限、規則是提醒 —— 不講清楚,reviewer 會照它的低召回取捨收斂。"""
+    from milestone_pipeline.prompts import hybrid_review_prompt
+    text = hybrid_review_prompt(7, 1, "spec", "section")
+    assert "下限,不是上限" in text
+    assert "不是收斂指令" in text
+
+
+def test_hybrid_scan_fails_open_on_bad_gh_json(tmp_path):
+    """gh 輸出壞掉時要 fail-open。JSONDecodeError 繼承 ValueError 不是 RuntimeError,
+    漏掉它 fail-open 就破功,整條 pipeline 會炸。"""
+    from milestone_pipeline.config import ReviewerCfg
+    from milestone_pipeline.reviewer import HybridReviewer
+    r = HybridReviewer(ReviewerCfg(model="opus", type="hybrid"), tmp_path, "master")
+    r.gh.pr_view = lambda *a, **k: (_ for _ in ()).throw(
+        json.JSONDecodeError("boom", "", 0))
+    section = r._scan(1)
+    assert "沒有跑成功" in section
+
+
+def test_ocr_unavailable_note_names_the_reason():
+    """OCR 失敗是 fail-open,但原因必須傳到 reviewer 眼前,不能靜默。"""
+    from milestone_pipeline.prompts import ocr_unavailable_note
+    note = ocr_unavailable_note("找不到 `ocr`")
+    assert "找不到 `ocr`" in note
+    assert "逐一審過" in note
+
+
 # -- 決策狀態 ----------------------------------------------------------------
 
 def test_await_fields_survive_roundtrip(tmp_path):
