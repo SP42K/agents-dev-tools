@@ -24,9 +24,12 @@ import shlex
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import prompts
+from .config import Config
+from .state import PH_AWAIT_HUMAN, PH_STUCK, PipelineState
 
 log = logging.getLogger("pipeline")
 
@@ -293,3 +296,145 @@ def _has_session(tmux_exe: str, name: str) -> bool:
     return subprocess.call([tmux_exe, "has-session", "-t", name],
                            stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL) == 0
+
+
+# -- `guards`:一眼看完這台機器上所有守護 agent -------------------------------
+#
+# 守護 agent 多半跑在別台(`ssh mac`),而回去看它的唯一入口是 `tmux attach -t
+# guard-<config stem>` —— 要先記得 session 叫什麼,而且一次只看得到一個。
+# 同時開多個專案時,沒有任何地方回答「總共幾條在跑、各自停在哪」。
+#
+# **這整段是唯讀報表,不是關卡。** 不取 `lock.exclusive()`、不寫 state。
+
+_CLI = "python -m milestone_pipeline"
+_NO_GUARD = "(無 guard)"
+
+
+@dataclass
+class GuardRow:
+    """一條 pipeline 在 `guards` 輸出裡佔的那幾行。"""
+    config: Path | None                              # None = 對不到 config 的孤兒 session
+    lines: list[str] = field(default_factory=list)
+    attention: bool = False                          # 需要人看一眼 → exit code 1
+
+
+def list_sessions(tmux_exe: str) -> list[str]:
+    """tmux 裡現在有哪些 session。沒有 server 在跑時 tmux 回 1,一律回 `[]`。"""
+    try:
+        p = subprocess.run([tmux_exe, "ls", "-F", "#{session_name}"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if p.returncode != 0:
+        return []
+    return [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 90:
+        return "剛剛"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} 分鐘前"
+    if seconds < 172800:
+        return f"{round(seconds / 3600)} 小時前"
+    return f"{round(seconds / 86400)} 天前"
+
+
+def summarize(config_path: Path, alive: bool, state: PipelineState | None,
+              mtime: float | None, now: float) -> GuardRow:
+    """把一條 pipeline 排成要印的那幾行。**純函式,不碰檔案系統**(才測得到)。
+
+    ⚠ 只給「停在 `stuck` / `await_human`」。**刻意不設「多久沒動就算卡住」的
+    門檻** —— implement 階段跑一小時不寫 state 是正常的,任何時間門檻都會誤報;
+    時間照印但不拿來判斷,留給人看。同 `repo_warnings` 不拿分支名當「code 乾不
+    乾淨」的代理。
+
+    同理**「沒有 guard session」本身不算問題** —— `nohup … run` 不配守護 agent
+    是既有的正常跑法(見 formosa.yaml 檔頭)。只有「停下來等人**而且**沒有守護
+    agent 會去按」才值得警告,那才是真的沒人會來。
+    """
+    name = session_name(str(config_path))
+    head = f"{name if alive else _NO_GUARD:<16}{config_path.name:<18}"
+    # `is not None`:mtime 是 epoch 秒數,`if mtime` 會把 0.0 當成「沒有」
+    age = _ago(now - mtime) if mtime is not None else "—"
+
+    if state is None:
+        return GuardRow(config_path, [f"{head}尚未開跑"])
+
+    ms = state.milestones.get(str(state.current))
+    phase = ms.phase if ms else "pending"
+    paused = phase in (PH_STUCK, PH_AWAIT_HUMAN)
+
+    bits = [f"M{state.current} {phase}"]
+    if ms and ms.await_reason:
+        bits.append(f"({ms.await_reason})")
+    if ms and ms.review_round:
+        bits.append(f"round={ms.review_round}")
+    if ms and ms.cost_usd:
+        bits.append(f"~${ms.cost_usd:.2f}")
+    bits.append(age)
+    if paused:
+        bits.append("⚠" if alive else "⚠ 沒有守護 agent 在顧")
+
+    row = GuardRow(config_path, [head + "  ".join(bits)], paused)
+    if not paused:
+        return row
+
+    # 停下來的話把指令一起印出來,不用去翻 `status`(同 `status` 的作法)。
+    tail = f"--config {config_path.name}"
+    n = state.current
+    if phase == PH_AWAIT_HUMAN:
+        row.lines.append(f"    放行: {_CLI} approve --milestone {n} {tail}")
+    else:
+        row.lines.append(f"    續跑: {_CLI} retry --milestone {n} {tail}")
+    row.lines.append(f'    打回: {_CLI} reject --milestone {n} --reason "..." {tail}')
+    if alive:
+        row.lines.append(f"    看它: tmux attach -r -t {name}")
+    return row
+
+
+def collect(workdir: Path, now: float | None = None) -> list[GuardRow]:
+    """掃 `workdir` 底下每個 config,配上 tmux 裡活著的 guard session。
+
+    config 是唯一的識別(`session_name()` 就是從它推出來的),所以這裡不需要、
+    也不該另外發明一份「有哪些專案」的登錄檔 —— 目錄裡的 yaml 就是答案。
+    """
+    now = time.time() if now is None else now
+    tmux_exe = _resolve("tmux")
+    sessions = set(list_sessions(tmux_exe)) if tmux_exe else set()
+
+    rows: list[GuardRow] = []
+    claimed: set[str] = set()
+    for p in sorted([*workdir.glob("*.yaml"), *workdir.glob("*.yml")]):
+        name = session_name(str(p))
+        alive = name in sessions
+        claimed.add(name)
+        try:
+            cfg = Config.load(p)
+        except (Exception, SystemExit) as e:
+            # `Config.load` 缺欄位丟 `KeyError`、`repo.path` 不存在丟 `SystemExit`
+            # —— **`SystemExit` 不是 `Exception` 的子類,兩個都要接**。
+            # 目錄裡本來就有不是 pipeline config 的 yaml(還有 `pipeline.yaml`
+            # 那份 repo.path 是佔位字串的範本),所以沒有 session 對到就安靜略過;
+            # 有 session 對到卻載不起來才是真的壞了,那要看得見。
+            if alive:
+                rows.append(GuardRow(
+                    p, [f"{name:<16}{p.name:<18}⚠ config 載入失敗: {e}"], True))
+            continue
+
+        sf = cfg.state_file
+        try:
+            exists = sf.exists()
+            state = PipelineState.load(sf) if exists else None
+            mtime = sf.stat().st_mtime if exists else None
+        except (OSError, ValueError) as e:
+            log.warning("讀不到 %s 的存檔 %s:%s", p.name, sf, e)
+            state, mtime = None, None
+        rows.append(summarize(p, alive, state, mtime, now))
+
+    # 對不到 config 的 guard session:config 改名或刪掉了,而那個守護 agent 還在跑。
+    for name in sorted(s for s in sessions - claimed if s.startswith("guard-")):
+        rows.append(GuardRow(
+            None, [f"{name:<16}⚠ 找不到對應的 config(改名或刪掉了?)"], True))
+    return rows

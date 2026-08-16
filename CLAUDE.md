@@ -216,6 +216,18 @@ process 結束時**才重新喚醒 agent,所以 `tail -f | grep` 這種永不結
 代理 `reviewer_seen` 那顆雷。而且只警告不擋:起飛路徑上不該有互動問題
 (同 park & notify 的理由),要選擇就加旗標,不要加提問。
 
+**`guards`(複數)是唯讀報表,它的 ⚠ 門檻是「停下來等人」,不是「多久沒動」。**
+`guard.collect()` 掃目錄裡的 config、配上 tmux 裡活著的 session,一條 pipeline 一行。
+兩個刻意不做的判斷:**不拿「多久沒寫存檔」當卡住的代理**(implement 階段跑一小時
+不寫 state 是正常的,時間照印但不判斷),**也不拿「沒有 guard session」當問題**
+(`nohup … run` 不配守護 agent 是既有的正常跑法)。只有兩者的交集 ——「停在
+`stuck` / `await_human` **而且**沒有守護 agent 會去按」—— 才是真的沒人會來。
+兩顆都是 `_SCOPE_LOCK` 用輪數代理 `reviewer_seen` 的同一個形狀。
+它**不取 `lock.exclusive()`、不寫 state**:報表不是關卡。
+另外 `Config.load` 對載不起來的 yaml 丟的是 `SystemExit`,**那不是 `Exception`
+的子類**,`except Exception` 接不到 —— 目錄裡一定會有非 pipeline 的 yaml(還有
+`repo.path` 是佔位字串的 `pipeline.yaml`),漏接就等於整份清單被一個範本檔炸掉。
+
 **同一份存檔只能有一個 `run`,而且鎖檔要進 `_own_artifacts()`。**
 `lock.exclusive()` 用 OS 檔案鎖(不是 pid 檔:crash / `kill -9` 之後 OS 自己
 放掉,不留要人判斷的殘骸)。鎖檔跟 state 檔同一個目錄,而 state 檔多半就在
@@ -244,7 +256,8 @@ Windows 上 unsnooze 跑不起來(靠 tmux / Zellij 的 pane 恢復),降級成�
   `gh` / `ocr` / `verify`(各自一個外部命令的 subprocess 封裝)、
   `prompts`(所有模板)、`runner`(SDK 回應收集)、`backend`(SDK 呼叫)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
-  `guard`(守護 agent 的啟動與權限邊界)、`lock`(存檔的獨佔鎖)、
+  `guard`(守護 agent 的啟動與權限邊界,以及 `guards` 那份唯讀報表)、
+  `lock`(存檔的獨佔鎖)、
   `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。
 - **通知失敗永遠不能中斷 pipeline。** `MultiNotifier` 會吞掉每個 channel 的

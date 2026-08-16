@@ -1300,3 +1300,142 @@ def test_lock_file_is_excluded_from_the_workspace_fingerprint(tmp_path):
         assert workspace_fingerprint(tmp_path, ignore=ignore) == before
         # 沒排掉的話它確實看得見 —— 證明這個忽略項不是多餘的
         assert workspace_fingerprint(tmp_path, ignore=[state.name]) != before
+
+
+# -- guards(唯讀報表)--------------------------------------------------------
+
+def _guards_yaml(tmp_path, name):
+    """造一份最小的 pipeline config,state 檔各自分開(同一個目錄多條 pipeline)。"""
+    raw = {
+        "repo": {"path": str(tmp_path)},
+        "plan": {"path": "plan.md"},
+        "implementer": {"model": "fable"},
+        "reviewer": {"model": "opus"},
+        "state_file": f".{name}-state.json",
+    }
+    p = tmp_path / f"{name}.yaml"
+    p.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return p
+
+
+def test_guards_summarize_warns_only_when_parked(tmp_path):
+    """⚠ 的門檻是「停下來等人」,不是「多久沒動」。
+
+    implement 階段跑一小時不寫 state 是正常的,拿時間當代理會誤報 ——
+    同 `repo_warnings` 不拿分支名當「code 乾不乾淨」的代理那顆雷。
+    """
+    from milestone_pipeline.guard import summarize
+    from milestone_pipeline.state import PH_REVIEW
+    p = tmp_path / "formosa.yaml"
+
+    running = PipelineState(current=6, milestones={
+        "6": MilestoneState(phase=PH_REVIEW, review_round=3,
+                            implementer_cost_usd=21.4)})
+    # 三小時沒動,但它只是在跑 —— 不該有 ⚠,也不該多印指令
+    row = summarize(p, alive=True, state=running, mtime=0.0, now=10800.0)
+    assert row.attention is False
+    assert len(row.lines) == 1
+    assert "⚠" not in row.lines[0]
+    assert "guard-formosa" in row.lines[0] and "round=3" in row.lines[0]
+    assert "~$21.40" in row.lines[0] and "3 小時前" in row.lines[0]
+
+
+def test_guards_summarize_parked_prints_the_commands_and_the_attach(tmp_path):
+    """停下來時要能直接複製指令,不用再去翻 `status`(同 `status` 的作法)。"""
+    from milestone_pipeline.guard import summarize
+    p = tmp_path / "shopapp.yaml"
+    state = PipelineState(current=2, milestones={
+        "2": MilestoneState(phase=PH_AWAIT_HUMAN, await_reason="merge_gate")})
+
+    row = summarize(p, alive=True, state=state, mtime=0.0, now=60.0)
+    assert row.attention is True
+    body = "\n".join(row.lines)
+    assert "⚠" in row.lines[0] and "(merge_gate)" in row.lines[0]
+    assert "approve --milestone 2 --config shopapp.yaml" in body
+    assert "reject --milestone 2" in body
+    # 有守護 agent 在顧才印得出 attach 的入口
+    assert "tmux attach -r -t guard-shopapp" in body
+
+
+def test_guards_summarize_flags_parked_without_a_guard(tmp_path):
+    """「沒有守護 agent」本身不是問題,`nohup … run` 就是這樣跑的。
+
+    真正沒人會來的是「停下來等人 **而且** 沒有守護 agent」—— 警告只給這個組合。
+    """
+    from milestone_pipeline.guard import summarize
+    from milestone_pipeline.state import PH_STUCK
+    p = tmp_path / "sideproj.yaml"
+    stuck = PipelineState(current=4, milestones={
+        "4": MilestoneState(phase=PH_STUCK)})
+
+    row = summarize(p, alive=False, state=stuck, mtime=0.0, now=60.0)
+    assert row.attention is True
+    body = "\n".join(row.lines)
+    assert "沒有守護 agent 在顧" in body and "(無 guard)" in body
+    # stuck 要給的是 retry(輪數用盡),不是 approve
+    assert "retry --milestone 4" in body and "approve" not in body
+    assert "tmux attach" not in body          # 沒有 session 可以 attach
+
+    # 同一條 pipeline 還在跑的話,沒有守護 agent 不該有任何警告
+    from milestone_pipeline.state import PH_IMPLEMENT
+    running = PipelineState(current=4, milestones={
+        "4": MilestoneState(phase=PH_IMPLEMENT)})
+    assert summarize(p, False, running, 0.0, 60.0).attention is False
+
+
+def test_guards_collect_skips_yaml_that_is_not_a_pipeline_config(tmp_path,
+                                                                monkeypatch):
+    """目錄裡本來就有別的 yaml,還有 repo.path 是佔位字串的 `pipeline.yaml`。
+
+    一份載不起來的 config 不能把整份清單炸掉 —— 而 `Config.load` 丟的是
+    `SystemExit`,它**不是** `Exception` 的子類。
+    """
+    from milestone_pipeline import guard
+    monkeypatch.setattr(guard, "_resolve", lambda exe: None)   # 當作沒有 tmux
+
+    good = _guards_yaml(tmp_path, "good")
+    PipelineState(current=1, milestones={
+        "1": MilestoneState(phase=PH_AWAIT_HUMAN, await_reason="merge_gate")}
+    ).save(tmp_path / ".good-state.json")
+    # 不是 pipeline config
+    (tmp_path / "ci.yaml").write_text(yaml.safe_dump({"jobs": {}}), encoding="utf-8")
+    # 是 pipeline config,但 repo.path 不存在 → Config.load 丟 SystemExit
+    (tmp_path / "template.yaml").write_text(yaml.safe_dump({
+        "repo": {"path": "/nope/nope"}, "plan": {"path": "p.md"},
+        "implementer": {"model": "fable"}, "reviewer": {"model": "opus"},
+    }), encoding="utf-8")
+
+    rows = guard.collect(tmp_path, now=60.0)
+    assert [r.config for r in rows] == [good]
+    assert rows[0].attention is True
+
+
+def test_guards_collect_surfaces_a_broken_config_that_has_a_live_guard(
+        tmp_path, monkeypatch):
+    """安靜略過只對「不是 pipeline config」成立。
+
+    有守護 agent 正在顧、config 卻載不起來,那是真的壞了,不能跟著被吞掉。
+    """
+    from milestone_pipeline import guard
+    monkeypatch.setattr(guard, "_resolve", lambda exe: "tmux")
+    monkeypatch.setattr(guard, "list_sessions",
+                        lambda exe: ["guard-broken", "guard-ghost"])
+
+    (tmp_path / "broken.yaml").write_text(yaml.safe_dump({
+        "repo": {"path": "/nope/nope"}, "plan": {"path": "p.md"},
+        "implementer": {"model": "fable"}, "reviewer": {"model": "opus"},
+    }), encoding="utf-8")
+
+    rows = guard.collect(tmp_path, now=60.0)
+    body = "\n".join(ln for r in rows for ln in r.lines)
+    assert "config 載入失敗" in body
+    # 對不到任何 config 的 session 也要看得見(config 被改名或刪掉了)
+    assert "guard-ghost" in body and "找不到對應的 config" in body
+    assert all(r.attention for r in rows)
+
+
+def test_guards_summarize_handles_a_config_that_never_ran(tmp_path):
+    from milestone_pipeline.guard import summarize
+    row = summarize(tmp_path / "new.yaml", alive=False, state=None,
+                    mtime=None, now=60.0)
+    assert row.attention is False and "尚未開跑" in row.lines[0]

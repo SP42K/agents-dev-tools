@@ -44,16 +44,39 @@ python -m milestone_pipeline run    --config my-pipeline.yaml
 python -m milestone_pipeline status --config my-pipeline.yaml
 python -m milestone_pipeline retry  --config my-pipeline.yaml --milestone 2
 python -m milestone_pipeline reset  --config my-pipeline.yaml --milestone 2
+python -m milestone_pipeline guard  --config my-pipeline.yaml   # 起一個守護 agent
+python -m milestone_pipeline guards                             # 全部看一遍
 ```
 
-`run` / `status` 在流程卡住時 exit code 為 1,方便 CI 判斷。
+`run` / `status` / `guards` 在流程卡住時 exit code 為 1,方便 CI 判斷。
 
 | 指令 | 作用 |
 | --- | --- |
 | `run` | 從斷點續跑到全部 milestone 完成 |
 | `status` | 列出每個 milestone 的 phase / PR / 輪數 / 花費 |
+| `guard` | 起一個守護 agent(tmux session `guard-<config stem>`)代替人在 park 點做決策;它被關掉了所有寫入工具 |
+| `guards` | **唯讀報表**:掃一個目錄底下所有 config,配上 tmux 裡活著的守護 agent,一條 pipeline 印一行。吃 `--dir`(預設當前目錄),不吃 `--config` |
 | `retry --milestone N` | 人工處理完卡住的 PR 後,把 review 輪數歸零讓迴圈可以再跑,**保留** PR 編號與 implementer 的 session_id(不丟 context) |
 | `reset --milestone N` | 整個 milestone 的進度清掉重來(PR、session 都不留);不加 `--milestone` 則清除全部 |
+
+守護 agent 多半跑在另一台機器上,所以 `guards` 的典型用法是一行 ssh:
+
+```bash
+ssh mac 'cd ~/Documents/agents-dev-tools && .venv/bin/python -m milestone_pipeline guards'
+```
+
+```
+guard-formosa   formosa.yaml      M6 review  round=3  ~$21.40  2 分鐘前
+guard-shopapp   shopapp.yaml      M2 await_human  (merge_gate)  41 分鐘前  ⚠
+    放行: python -m milestone_pipeline approve --milestone 2 --config shopapp.yaml
+    打回: python -m milestone_pipeline reject --milestone 2 --reason "..." --config shopapp.yaml
+    看它: tmux attach -r -t guard-shopapp
+(無 guard)      sideproj.yaml     M4 stuck  3 小時前  ⚠ 沒有守護 agent 在顧
+```
+
+⚠ 只給「停下來等人」,**不給「多久沒動」** —— implement 階段跑一小時不寫存檔是
+正常的,時間照印但不拿來判斷。同理沒有守護 agent 本身不是問題(`nohup … run`
+就是這樣跑的),只有「停下來等人**而且**沒有守護 agent 會去按」才會被點名。
 
 Plan file 格式見 `plan.example.md`:每個 `## ` 標題一個 milestone,
 第一個標題前的內容是整體背景(每個 milestone 都會附給 implementer)。
