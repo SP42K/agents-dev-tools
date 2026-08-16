@@ -1439,3 +1439,123 @@ def test_guards_summarize_handles_a_config_that_never_ran(tmp_path):
     row = summarize(tmp_path / "new.yaml", alive=False, state=None,
                     mtime=None, now=60.0)
     assert row.attention is False and "尚未開跑" in row.lines[0]
+
+
+# -- Telegram 控制端點 --------------------------------------------------------
+
+def test_tgbot_parses_the_whitelisted_commands():
+    from milestone_pipeline.tgbot import parse_command
+    assert parse_command("/guards").verb == "guards"
+    # 群組裡 Telegram 會送成 /guards@my_bot
+    assert parse_command("/guards@my_bot").verb == "guards"
+
+    c = parse_command("/approve formosa 6")
+    assert (c.verb, c.project, c.milestone) == ("approve", "formosa", 6)
+
+    # 打回的理由是一段話,空白與換行都要原封不動留著
+    c = parse_command("/reject formosa 6 fixture 跟真實回應對不上\n再確認一次")
+    assert c.reason == "fixture 跟真實回應對不上\n再確認一次"
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "隨便講一句話",
+    "/reset formosa",            # 不可逆的清除刻意不在白名單裡
+    "/run formosa",              # 沒有任意命令這種東西
+    "/approve formosa",          # 少了 milestone
+    "/approve formosa -1",       # 不是正整數
+    "/approve formosa 1.5",
+    "/status",                   # 少了專案
+    "/reject formosa 6",         # reject 一定要有理由
+])
+def test_tgbot_rejects_anything_not_on_the_whitelist(text):
+    """認不得就 `None` —— 白名單,不是黑名單。"""
+    from milestone_pipeline.tgbot import parse_command
+    assert parse_command(text) is None
+
+
+def test_tgbot_chat_id_whitelist_fails_closed():
+    """chat id 是這個 bot 唯一的存取控制,所以每條退化路徑都要回 False。
+
+    尤其「沒設定」不能等於「放行所有人」—— 這與 notify 那邊缺設定只警告的
+    fail-open **刻意相反**:那裡缺了是收不到通知,這裡缺了是誰都能下 approve。
+    """
+    from milestone_pipeline.tgbot import authorized
+    mine = {"message": {"chat": {"id": 12345}, "text": "/guards"}}
+    assert authorized(mine, "12345")          # 數字 vs 字串也要對得起來
+
+    assert not authorized(mine, "99999")      # 別人的 chat
+    assert not authorized(mine, "")           # 沒設定
+    assert not authorized({}, "12345")        # 不是 message 的 update
+    # 把舊訊息編輯成 /approve 不該觸發決策
+    assert not authorized(
+        {"edited_message": {"chat": {"id": 12345}, "text": "/approve x 1"}}, "12345")
+
+
+def test_tgbot_project_name_is_a_table_lookup_not_a_path(tmp_path):
+    """專案名只能對到掃出來的 config,拼路徑的寫法要對不到任何東西。"""
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.tgbot import resolve_config
+    good = tmp_path / "formosa.yaml"
+    rows = [GuardRow(good, ["..."]), GuardRow(None, ["孤兒 session"])]
+
+    assert resolve_config("formosa", rows) == good
+    for bad in ("../../etc/passwd", "formosa.yaml", "/etc/passwd", "nope", ""):
+        assert resolve_config(bad, rows) is None
+
+
+def test_tgbot_handle_runs_the_verb_and_restarts_run(tmp_path, monkeypatch):
+    """決策成功才重啟 `run`;`status` 與失敗都不該重啟。"""
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    cfg = tmp_path / "formosa.yaml"
+    monkeypatch.setattr(tgbot.guard, "collect", lambda d: [GuardRow(cfg, ["x"])])
+
+    calls, restarts = [], []
+    monkeypatch.setattr(tgbot, "run_verb",
+                        lambda p, v, m=None, r="": (calls.append((v, m, r)), (0, "ok"))[1])
+    monkeypatch.setattr(tgbot, "restart_run", lambda p: restarts.append(p) or "/tmp/x.log")
+
+    reply = tgbot.handle("/approve formosa 6", tmp_path)
+    assert calls == [("approve", 6, "")] and restarts == [cfg]
+    assert "已重啟 run" in reply
+
+    # status 只是讀,不重啟(而且它停下來時本來就 exit 1)
+    restarts.clear()
+    monkeypatch.setattr(tgbot, "run_verb", lambda p, v, m=None, r="": (1, "停在 M6"))
+    assert "停在 M6" in tgbot.handle("/status formosa", tmp_path)
+    assert restarts == []
+
+    # 決策失敗也不重啟 —— state 沒動,重啟只會再 park 一次
+    assert "已重啟" not in tgbot.handle("/approve formosa 6", tmp_path)
+    assert restarts == []
+
+
+def test_tgbot_handle_reports_an_unknown_project(tmp_path, monkeypatch):
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(tmp_path / "formosa.yaml", ["x"])])
+    reply = tgbot.handle("/approve nope 1", tmp_path)
+    assert "找不到專案" in reply and "formosa" in reply
+
+
+def test_tgbot_serve_refuses_to_start_without_the_chat_id(tmp_path, monkeypatch):
+    """沒有白名單就等於對所有人開放 —— 這裡不降級成警告。"""
+    from milestone_pipeline import tgbot
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(SystemExit):
+        tgbot.serve(tmp_path)
+
+
+def test_tgbot_poll_once_survives_a_network_error(monkeypatch):
+    """一次網路抖動不該讓 bot 掛掉,而且 offset 不能因此前進。"""
+    import urllib.error
+
+    from milestone_pipeline import tgbot
+
+    def boom(*a, **kw):
+        raise urllib.error.URLError("nope")
+    monkeypatch.setattr(tgbot.urllib.request, "urlopen", boom)
+    assert tgbot.poll_once("token", 42) == ([], 42)

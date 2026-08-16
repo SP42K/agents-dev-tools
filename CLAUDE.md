@@ -228,6 +228,18 @@ process 結束時**才重新喚醒 agent,所以 `tail -f | grep` 這種永不結
 的子類**,`except Exception` 接不到 —— 目錄裡一定會有非 pipeline 的 yaml(還有
 `repo.path` 是佔位字串的 `pipeline.yaml`),漏接就等於整份清單被一個範本檔炸掉。
 
+**`tgbot` 是唯一「進來」的方向,所以它的 fail 方向跟其他 telegram code 相反。**
+`notify` 那邊缺 token / chat id 只警告(缺了頂多這台收不到通知);`tgbot.serve()`
+兩個環境變數缺一個就 `SystemExit` —— `chat_id` 白名單是這個 bot **唯一**的存取
+控制,沒設定不能等於放行所有人。同一件事在 `authorized()` 裡要再擋一次
+(`chat_id` 為空回 `False`)。三個配套的邊界都不能拿掉:指令是**白名單**
+(`_VERBS`,`reset` 刻意不在裡面 —— 不可逆的清除不該掛在手機打字打錯就會觸發的
+介面上)、**argv list 不走 shell**(reject 的理由是使用者自由文字)、專案名
+**查 `guard.collect()` 的表而不是拼路徑**。新增任何指令之前先問:它能不能被用來
+繞過 reviewer 或 verify?(同守護 agent 那條。)
+另外 `getUpdates` 的 offset **一定要先落地再處理訊息** —— 不然處理到一半 crash,
+重啟會把 `/approve` 再吃一次。
+
 **同一份存檔只能有一個 `run`,而且鎖檔要進 `_own_artifacts()`。**
 `lock.exclusive()` 用 OS 檔案鎖(不是 pid 檔:crash / `kill -9` 之後 OS 自己
 放掉,不留要人判斷的殘骸)。鎖檔跟 state 檔同一個目錄,而 state 檔多半就在
@@ -257,7 +269,7 @@ Windows 上 unsnooze 跑不起來(靠 tmux / Zellij 的 pane 恢復),降級成�
   `prompts`(所有模板)、`runner`(SDK 回應收集)、`backend`(SDK 呼叫)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
   `guard`(守護 agent 的啟動與權限邊界,以及 `guards` 那份唯讀報表)、
-  `lock`(存檔的獨佔鎖)、
+  `tgbot`(Telegram 控制端點:唯一對外開放的入口)、`lock`(存檔的獨佔鎖)、
   `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。
 - **通知失敗永遠不能中斷 pipeline。** `MultiNotifier` 會吞掉每個 channel 的
