@@ -717,6 +717,17 @@ def test_discord_payload_is_truncated():
     assert len(payload["content"]) <= 1900
 
 
+def test_applescript_str_escapes_in_the_right_order():
+    """反斜線要先跳脫 —— 顛倒的話補進去的 `\\"` 會被再跳脫一次,引號就漏出來。"""
+    from milestone_pipeline.notify import _applescript_str
+    assert _applescript_str('a"b') == '"a\\"b"'
+    assert _applescript_str("a\\b") == '"a\\\\b"'
+    # 反斜線後面接引號:最容易踩的組合
+    assert _applescript_str('a\\"b') == '"a\\\\\\"b"'
+    # AppleScript 字串常值不能含真正的換行
+    assert "\n" not in _applescript_str("a\nb")
+
+
 def test_make_notifier_returns_null_when_no_channels(tmp_path):
     from milestone_pipeline.config import NotifyCfg
     from milestone_pipeline.notify import NullNotifier, make_notifier
