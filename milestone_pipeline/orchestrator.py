@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from . import lock
 from .backend import make_backend
 from .config import Config
 from .gh import Gh
@@ -76,11 +77,19 @@ class Orchestrator:
 
         state 檔多半就放在目標 repo 裡,而 `_save()` 每輪都會改寫它 ——
         不排掉的話指紋每次都不一樣,「沒變動就不重跑」永遠不會生效。
+
+        鎖檔(`lock.lock_path()`)跟 state 檔同一個目錄,要一起排掉:它是
+        **未追蹤**的新檔案,會出現在 `status --porcelain` 裡,不排的話除了
+        弄髒指紋,連 reviewer 與 merge gate 的「`git status` 乾淨」都會被它汙染。
         """
-        try:
-            return [self.cfg.state_file.relative_to(self.cfg.repo_path).as_posix()]
-        except ValueError:      # state 檔在 repo 外,本來就不會出現在 git 輸出裡
-            return []
+        own = [self.cfg.state_file, lock.lock_path(self.cfg.state_file)]
+        out = []
+        for p in own:
+            try:
+                out.append(p.relative_to(self.cfg.repo_path).as_posix())
+            except ValueError:  # 在 repo 外,本來就不會出現在 git 輸出裡
+                pass
+        return out
 
     def _check_ocr(self) -> None:
         """起飛前檢查:hybrid 少了 `ocr` 只是降級,不是錯誤,所以只記警告。"""

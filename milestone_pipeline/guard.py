@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -65,6 +67,57 @@ def has_global_unsnooze_hook(settings_path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return "unsnooze" in json.dumps(data.get("hooks", {}))
+
+
+def session_name(config_path: str) -> str:
+    """tmux session 的名字,同時也是這個守護 agent 的身分。
+
+    一個名字解三件事:**要不要開第二個**(`tmux has-session`)、
+    **怎麼回去看**(`tmux attach`)、以及 **unsnooze 醒來要往哪裡打字**。
+    不必另外發明 pid 檔 —— session 不在了就是不在了,沒有殘骸要清。
+
+    名字從 config 檔名推:一台機器上一條 pipeline 一個守護 agent,而 config
+    本來就是那條 pipeline 的識別。tmux 不吃 `.` 與 `:`,一律換成 `-`。
+    """
+    stem = re.sub(r"[^0-9A-Za-z_-]", "-", Path(config_path).stem).strip("-")
+    return f"guard-{stem or 'pipeline'}"
+
+
+def repo_warnings(cwd: Path) -> list[str]:
+    """起飛前對 orchestrator 自己這個 repo 的檢查。**只警告,不擋。**
+
+    要防的是「跑到的 orchestrator 不是 git 裡那份」:本機改了 `prompts.py`
+    沒 commit,行為就跟你以為的不一樣,而這種差異在 log 裡看不出來。
+
+    **刻意不看「在不在 master 上」** —— 分支名不是「code 乾不乾淨」的代理:
+    在 feature branch 上開發這條 pipeline 本來就是正常的(`guard` 這個功能
+    自己就是在 feature branch 上寫的)。拿分支當代理是 CLAUDE.md 裡
+    `_SCOPE_LOCK` 用輪數代理 `reviewer_seen` 那顆雷的同一個形狀。
+    """
+    def git(*args: str) -> str | None:
+        try:
+            p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                               text=True, encoding="utf-8", errors="replace",
+                               timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return p.stdout.strip() if p.returncode == 0 else None
+
+    out: list[str] = []
+    dirty = git("status", "--porcelain")
+    if dirty:
+        n = len(dirty.splitlines())
+        out.append(
+            f"{cwd} 有 {n} 個未 commit 的變動 —— 守護 agent 跑的 orchestrator "
+            f"不是 git 裡那份,行為可能跟你以為的不一樣。")
+    # 不 fetch:那是網路動作,起飛路徑上不該卡在它。所以這個數字反映的是
+    # **上次 fetch 之後**的落後量,抓得到「昨天 pull 完就沒再理它」這種。
+    behind = git("rev-list", "--count", "HEAD..@{u}")
+    if behind and behind != "0":
+        out.append(
+            f"{cwd} 落後 upstream {behind} 個 commit(以上次 fetch 為準)——"
+            "可能少了已經修好的東西,先 `git pull` 比較保險。")
+    return out
 
 
 def build_argv(config_path: str, claude_exe: str,
@@ -120,6 +173,54 @@ def run(config_path: str) -> int:
             "pipeline 本來就固定在同一台跑完,見 config 開頭的說明。)"
         )
 
+    cwd = Path(config_path).resolve().parent
+    for w in repo_warnings(cwd):
+        log.warning(w)
+
     argv = build_argv(config_path, claude_exe, unsnooze_exe)
+    tmux_exe = _resolve("tmux")
+    if not tmux_exe:
+        # Windows 走這條。前景跑仍然有 `_DENY` 與系統提示,只是關掉終端就沒了,
+        # 而且 unsnooze 沒有 pane 可以喚醒 —— 這是降級,不是錯誤。
+        log.warning(
+            "沒有 `tmux`,改用前景跑:關掉這個終端守護 agent 就沒了。"
+            "(unsnooze 是靠往 pane 裡打字來喚醒的,沒有 tmux 就沒有自動恢復。)"
+        )
+        log.info("啟動守護 agent(唯讀:已關閉 %s)…", ", ".join(_DENY))
+        return subprocess.call(argv, cwd=cwd)
+
+    name = session_name(config_path)
+    if _has_session(tmux_exe, name):
+        # 開第二個不會噴錯,只會有兩個守護 agent 對同一個 gate 各自下決策 ——
+        # 一個 approve 一個 reject,而且兩個都會去重啟 `run`。
+        log.warning(
+            "已經有一個守護 agent 在顧 `%s`(tmux session `%s`),不再開第二個。\n"
+            "  看它:tmux attach -t %s   (離開:ctrl+b d)\n"
+            "  換掉:tmux kill-session -t %s 之後再跑一次",
+            config_path, name, name, name)
+        return 0
+
     log.info("啟動守護 agent(唯讀:已關閉 %s)…", ", ".join(_DENY))
-    return subprocess.call(argv, cwd=Path(config_path).resolve().parent)
+    # shlex.join:prompt 裡有換行與引號,交給 tmux 自己拆會拆錯。
+    rc = subprocess.call(
+        [tmux_exe, "new-session", "-d", "-s", name, shlex.join(argv)], cwd=cwd)
+    if rc != 0:
+        return rc
+    # `new-session` 的 rc 只代表 tmux 建得起來,不代表裡面那個命令活著 ——
+    # 命令一啟動就死的話 tmux 會馬上收掉 session,而我們會回報「已跑起來」。
+    # 立刻回頭確認一次(只抓得到「秒死」,但那正是設定錯時的樣子)。
+    if not _has_session(tmux_exe, name):
+        log.error("tmux session `%s` 建好之後立刻就沒了 —— 守護 agent 沒能啟動。"
+                  "拿掉 tmux 在前景跑一次就看得到原因(例如 claude 需要先登入)。",
+                  name)
+        return 1
+    log.info("守護 agent 已在背景的 tmux session `%s` 裡跑起來。\n"
+             "  看它:tmux attach -t %s   (離開:ctrl+b d,不會中斷它)\n"
+             "  停它:tmux kill-session -t %s", name, name, name)
+    return 0
+
+
+def _has_session(tmux_exe: str, name: str) -> bool:
+    return subprocess.call([tmux_exe, "has-session", "-t", name],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0

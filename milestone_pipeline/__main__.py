@@ -26,7 +26,7 @@ import asyncio
 import logging
 import sys
 
-from . import guard
+from . import guard, lock
 from .config import Config
 from .notify import R_AGENT_ERROR, R_MERGE_GATE, R_UNRESOLVED
 from .orchestrator import Orchestrator, PipelineError
@@ -58,11 +58,13 @@ def main() -> None:
     cfg = Config.load(args.config)
 
     if args.command == "run":
-        try:
-            ok = asyncio.run(Orchestrator(cfg).run())
-        except PipelineError as e:
-            logging.getLogger("pipeline").error("%s", e)
-            sys.exit(1)
+        # 鎖圈住整段 run:兩個 orchestrator 併跑會互相覆蓋存檔(見 lock.py)。
+        with lock.exclusive(cfg.state_file):
+            try:
+                ok = asyncio.run(Orchestrator(cfg).run())
+            except PipelineError as e:
+                logging.getLogger("pipeline").error("%s", e)
+                sys.exit(1)
         sys.exit(0 if ok else 1)
 
     elif args.command == "guard":

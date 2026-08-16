@@ -363,9 +363,20 @@ ssh host 'kill $(cat ~/pipeline.pid)'    # 中途叫停(§8)
 log **不要放 `/tmp`**(macOS 會清);PID 檔讓「merge 完就停」那招(§8)
 從任何一台機器都下得了手。
 
-**不需要 tmux。** orchestrator 從來不讀 stdin(park 是存檔 → 通知 → exit,
+**orchestrator 不需要 tmux。** 它從來不讀 stdin(park 是存檔 → 通知 → exit,
 刻意不 `input()` 等人,見 §6),所以「接上一個互動終端」在這裡是零收益 ——
 attach 就是讀那個 log,而 agent 的文字會即時落地(§5),離線期間發生的事一件不漏。
+
+**但守護 agent 需要**(§7),它剛好相反:是互動 session,而 unsnooze 的喚醒方式
+就是往它的 pane 裡打字。`guard` 會自己處理,不用你手動開 —— 別把上面那段
+`nohup … &` 套到 `guard` 上,你會得到一個沒有 TTY、ssh 一斷就死、
+unsnooze 也叫不醒的 session。
+
+**同一份存檔只能有一個 `run`。** `run` 進場會拿一個 OS 檔案鎖
+(`<state 檔>.lock`),已經有人拿著就直接停下來並告訴你。兩個 orchestrator
+併跑不會噴錯,只會互相覆蓋 `.pipeline-state.json` —— 症狀出現時已經是
+「implementer 接不回 context」或「同一個 milestone 開了兩個 PR」。
+鎖檔在 crash / `kill -9` 之後由 OS 自己放掉,沒有殘骸要清。
 
 **`session_id` 綁在跑它那台機器的 `~/.claude/projects/` 底下,不能跨機器 resume。**
 所以要換機器就在 milestone 之間換(前一個 merge 完、下一個還沒起跑),
@@ -503,6 +514,32 @@ console.log(await tool.handler({ ... }, ctx));
 python -m milestone_pipeline guard --config formosa.yaml
 ```
 
+有 tmux 的話它會**起在背景的 tmux session 裡**,名字從 config 檔名推出來
+(`formosa.yaml` → `guard-formosa`)。那個名字同時是三件事:
+
+```bash
+tmux has-session -t guard-formosa   # 有沒有守護 agent 在顧這條 pipeline
+tmux attach -t guard-formosa        # 回去看它(ctrl+b d 離開,不會中斷它)
+tmux kill-session -t guard-formosa  # 換掉它
+```
+
+**所以「先檢查有沒有」不需要另外發明 pid 檔** —— session 不在了就是不在了,
+沒有殘骸要判斷。再跑一次 `guard` 也不會開出第二個:偵測到同名 session 就
+印出 attach 指令然後退出。(兩個守護 agent 會對同一個 gate 各自下決策 ——
+一個 approve 一個 reject,而且兩個都會去重啟 `run`。)
+
+從另一台機器起飛就是普通的 ssh,不用 `nohup`,tmux 已經處理了持久化:
+
+```bash
+ssh mac 'cd ~/Documents/agents-dev-tools && \
+  .venv/bin/python -m milestone_pipeline guard --config formosa.yaml'
+```
+
+起飛前它會警告(**只警告,不擋**)工作目錄有未 commit 的變動、或落後 upstream
+—— 要防的是「跑到的 orchestrator 不是 git 裡那份」。**刻意不看在不在 `master` 上**:
+分支名不是「code 乾不乾淨」的代理(`guard` 這個功能自己就是在 feature branch
+上寫的),拿它當代理是 CLAUDE.md 裡 `_SCOPE_LOCK` 那顆雷的同一個形狀。
+
 **它被關掉了所有寫入工具**(`Edit` / `Write` / `NotebookEdit` /
 `git commit` / `git push` / `gh pr merge`,見 `guard._DENY`)。這不是保守,
 是實測過的:formosa M8 那輪,守護 agent 在 merge gate 上發現 `README.en.md`
@@ -539,7 +576,8 @@ deny 規則**,不是把工具拿掉 —— 語意上跟 SDK 那邊 `tools=` vs `
 裝過的話 `guard` 啟動時會警告,用 `unsnooze uninstall` 拆掉。
 
 **Windows 上不會有 auto-resume**,unsnooze 靠 tmux / Zellij 的 pane 恢復,
-Windows 沒有。`guard` 會印警告然後照常跑(deny 與 prompt 兩邊都是跨平台的)。
+Windows 兩個都沒有 —— 沒 tmux 就退回前景跑(關掉終端就沒了),`guard` 會把
+這兩件事都印出來然後照常跑(deny 與 prompt 兩邊都是跨平台的)。
 這不影響實務:implementer 的 session_id 綁在跑它那台,pipeline 本來就固定
 在同一台跑完(見 config 開頭)。
 
