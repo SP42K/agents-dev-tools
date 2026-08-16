@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -171,14 +172,56 @@ class WebhookNotifier(Notifier):
             raise RuntimeError(f"webhook HTTP {e.code}") from None
 
 
-class DesktopNotifier(Notifier):
-    """Windows 氣泡通知。人在電腦前時最即時,人不在就等於沒通知,當補充用。
+def _applescript_str(text: str) -> str:
+    """把任意文字包成 AppleScript 的字串常值(含前後引號)。
 
-    用 -EncodedCommand(UTF-16LE base64)餵 PowerShell:這台機器的 console
-    預設是 cp950,直接用 -Command 傳中文會被吃掉。
+    順序不能顛倒:反斜線一定要先跳脫,否則後面補進去的 `\\"` 會被再跳脫一次。
+    AppleScript 的字串常值不能含真正的換行,所以換成 `\\n` 跳脫序列。
+    """
+    body = (text.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n"))
+    return f'"{body}"'
+
+
+class DesktopNotifier(Notifier):
+    """桌面氣泡通知。人在電腦前時最即時,人不在就等於沒通知,當補充用。
+
+    **同一份 config 會在兩台機器上跑**(這條 pipeline 在 milestone 之間換過
+    機器,見 `formosa.yaml` 檔頭),所以這裡按平台分支而不是要人改 config ——
+    否則 mac 上每次 park 都會噴 `No such file or directory: 'powershell'`。
+    不認得的平台沒有共通做法,記個 log 就算了(通知本來就是旁路)。
     """
 
     def notify(self, decision: Decision) -> None:
+        if sys.platform == "darwin":
+            self._darwin(decision)
+        elif sys.platform == "win32":
+            self._win32(decision)
+        else:
+            log.warning("DesktopNotifier:平台 %s 沒有桌面通知實作,略過。",
+                        sys.platform)
+
+    def _darwin(self, decision: Decision) -> None:
+        """macOS:osascript。不經 shell,所以只要處理 AppleScript 自己的跳脫。
+
+        **從 ssh 起的行程看不到通知中心**:rc 是 0,stderr 只有一行
+        `NSNotificationCenter connection invalid`,然後什麼都不會跳出來 ——
+        因為那個行程不在 GUI(Aqua)session 裡。`launchctl asuser` 可以送進去,
+        但它要 root,不適合放在這裡。所以無人值守跑(orchestrator 由 ssh 起)
+        時 desktop 這個 channel 等於沒有,要靠 `pr_comment` / `webhook`;
+        在 mac 上直接開終端機跑才收得到。這是平台限制,不是這裡的 bug。
+        """
+        script = (f"display notification {_applescript_str(decision.plain())} "
+                  f'with title "milestone-pipeline"')
+        subprocess.run(["osascript", "-e", script],
+                       capture_output=True, timeout=60)
+
+    def _win32(self, decision: Decision) -> None:
+        """Windows:用 -EncodedCommand(UTF-16LE base64)餵 PowerShell。
+
+        這台機器的 console 預設是 cp950,直接用 -Command 傳中文會被吃掉。
+        """
         text = decision.plain().replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Windows.Forms;"
