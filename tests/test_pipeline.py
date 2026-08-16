@@ -1161,6 +1161,24 @@ def test_guard_argv_wraps_with_unsnooze_only_when_present():
     assert wrapped[0] == "unsnooze" and wrapped[1:] == plain
 
 
+def test_guard_spots_an_unaccepted_bypass_prompt(tmp_path):
+    """沒接受過 bypassPermissions 的機器上,守護 agent 會停在同意對話框上。
+
+    那正是 `--permission-mode` 要修的病本身,而 tmux detached 看不到 —— 所以
+    起飛前要講一聲。讀不到 / 壞掉一律當成沒接受過(漏警告比多警告貴)。
+    """
+    from milestone_pipeline.guard import has_accepted_bypass
+
+    f = tmp_path / ".claude.json"
+    assert has_accepted_bypass(f) is False           # 檔案不存在
+    f.write_text("{ not json", encoding="utf-8")
+    assert has_accepted_bypass(f) is False           # 壞掉
+    f.write_text('{"bypassPermissionsModeAccepted": false}', encoding="utf-8")
+    assert has_accepted_bypass(f) is False
+    f.write_text('{"bypassPermissionsModeAccepted": true}', encoding="utf-8")
+    assert has_accepted_bypass(f) is True
+
+
 def test_guard_spots_a_global_unsnooze_install(tmp_path):
     """全域 hook 會讓 unsnooze 對機器上每個 session 生效,不只守護 agent。
 

@@ -69,6 +69,25 @@ def has_global_unsnooze_hook(settings_path: Path) -> bool:
     return "unsnooze" in json.dumps(data.get("hooks", {}))
 
 
+def has_accepted_bypass(config_path: Path) -> bool:
+    """這台機器是否同意過 bypassPermissions。
+
+    `--permission-mode bypassPermissions` 第一次用會跳一個一次性的同意對話框,
+    接受之後才寫進 `~/.claude.json`。**沒接受過的話,守護 agent 一起來就停在那個
+    對話框上** —— 跟它原本要修的病一模一樣:無人值守的 agent 被沒人按得到的
+    對話框擋住,而 tmux 是 detached 的,不 attach 根本看不到。
+
+    只警告不擋,理由同 unsnooze 那段:這是機器的一次性設定問題,不是正確性問題,
+    而且要人 attach 進去按一次才解得掉 —— 起飛路徑上不該有互動問題,擋住也沒用。
+    讀不到 / 不是 JSON 一律當成沒接受過(多警告一次的代價遠小於漏警告)。
+    """
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return data.get("bypassPermissionsModeAccepted") is True
+
+
 def session_name(config_path: str) -> str:
     """tmux session 的名字,同時也是這個守護 agent 的身分。
 
@@ -180,6 +199,14 @@ def run(config_path: str) -> int:
             "要人回來重開。(unsnooze 需要 tmux / Zellij,Windows 上跑不起來;"
             "pipeline 本來就固定在同一台跑完,見 config 開頭的說明。)"
         )
+
+    if not has_accepted_bypass(Path.home() / ".claude.json"):
+        log.warning(
+            "這台機器還沒同意過 bypassPermissions —— 守護 agent 一起來會停在同意"
+            "對話框上,而 tmux 是 detached 的,不 attach 看不到它在等。\n"
+            "  先按一次:tmux attach -t %s 之後選 `Yes, I accept`(一次性,"
+            "之後寫進 ~/.claude.json 就不再問)。",
+            session_name(config_path))
 
     cwd = Path(config_path).resolve().parent
     for w in repo_warnings(cwd):

@@ -185,6 +185,23 @@ commit 進分支,那個 commit 沒經過 reviewer、沒經過 verify,merge 時 C
 它讀得懂規矩,規矩當時只是文字。**新增守護 agent 的能力之前,先問這個能力能不能
 被用來繞過 reviewer 或 verify。**
 
+**守護 agent 要 `bypassPermissions`,而那個「唯讀」的保證來自 `_DENY`,不是來自
+權限對話框。** 預設的 ask 模式下,第一個不在 allowlist 裡的命令(`gh pr view`、
+驗收命令…)就停在對話框上等人按「允許」—— 而守護 agent 定義上就是**沒有人在旁邊**
+的那個角色。實測(formosa M12):它醒來開始驗 merge gate,第一個 `gh pr view` 就
+卡住,pipeline 空轉。deny 規則的優先權高於權限模式,所以放寬的只有「問不問」,
+不是「能不能」。**新增任何「起飛路徑上會跳對話框」的東西之前,先問誰會去按。**
+同一顆雷有第二層:`bypassPermissions` 本身有個一次性的機器層級同意對話框,
+沒接受過的機器上守護 agent 一起來就停在那裡,而 tmux 是 detached 的,看不到它在等
+—— `has_accepted_bypass()` 起飛前警告一次(只警告不擋,同 unsnooze:這是機器的
+設定問題,而且要人 attach 進去按才解得掉)。
+
+**守護 agent 的監控要用「會 exit」的形式。** Claude Code 的背景 task **只在
+process 結束時**才重新喚醒 agent,所以 `tail -f | grep` 這種永不結束的東西等於
+沒有監控 —— agent 會坐在 idle prompt 上,park 了也不知道(實測 formosa M12:
+空轉 36 分鐘)。要用 `grep -m1` 之類命中就 exit 的寫法。這條寫在
+`prompts.GUARDIAN_SYSTEM` 裡是不夠的,agent 每次都會重新發明一個 `tail -f`。
+
 **守護 agent 要 tmux,orchestrator 不用 —— 兩者相反,不要抄錯。** orchestrator
 從不讀 stdin,`nohup … &` 就夠;守護 agent 是**互動 session**,而 unsnooze 的
 喚醒方式是往它的 pane 裡打字,沒有 pane 就沒有自動恢復。所以 `guard` 有 tmux
