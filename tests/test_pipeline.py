@@ -1161,22 +1161,37 @@ def test_guard_argv_wraps_with_unsnooze_only_when_present():
     assert wrapped[0] == "unsnooze" and wrapped[1:] == plain
 
 
-def test_guard_spots_an_unaccepted_bypass_prompt(tmp_path):
-    """沒接受過 bypassPermissions 的機器上,守護 agent 會停在同意對話框上。
+def test_guard_only_sends_accept_keys_when_the_dialog_is_there(monkeypatch):
+    """替人按安全聲明,所以只能在畫面上真的有那個對話框時送鍵。
 
-    那正是 `--permission-mode` 要修的病本身,而 tmux detached 看不到 —— 所以
-    起飛前要講一聲。讀不到 / 壞掉一律當成沒接受過(漏警告比多警告貴)。
+    盲送 `2` 會打進 agent 正在等的一般 prompt,那就變成隨機注入。
     """
-    from milestone_pipeline.guard import has_accepted_bypass
+    from milestone_pipeline import guard
 
-    f = tmp_path / ".claude.json"
-    assert has_accepted_bypass(f) is False           # 檔案不存在
-    f.write_text("{ not json", encoding="utf-8")
-    assert has_accepted_bypass(f) is False           # 壞掉
-    f.write_text('{"bypassPermissionsModeAccepted": false}', encoding="utf-8")
-    assert has_accepted_bypass(f) is False
-    f.write_text('{"bypassPermissionsModeAccepted": true}', encoding="utf-8")
-    assert has_accepted_bypass(f) is True
+    sent: list[list[str]] = []
+    monkeypatch.setattr(guard.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guard.subprocess, "call", lambda a, **kw: sent.append(a) or 0)
+
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: "> 一般的 prompt,沒有對話框")
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is False
+    assert sent == [], "沒有對話框卻送了鍵"
+
+
+def test_guard_confirms_the_dialog_actually_went_away(monkeypatch):
+    """送完要再看一次 —— 同 new-session 之後回頭確認 session 還在的理由。"""
+    from milestone_pipeline import guard
+
+    monkeypatch.setattr(guard.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guard.subprocess, "call", lambda a, **kw: 0)
+
+    # 一直都在 = 沒按掉,要回 False 讓呼叫端警告,不能送完就宣告成功
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: guard._BYPASS_PROMPT)
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is False
+
+    # 先有、送完就不見了 = 真的按掉了
+    seen = iter([guard._BYPASS_PROMPT, "", "", ""])
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: next(seen, ""))
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is True
 
 
 def test_guard_spots_a_global_unsnooze_install(tmp_path):

@@ -23,6 +23,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from . import prompts
@@ -69,23 +70,61 @@ def has_global_unsnooze_hook(settings_path: Path) -> bool:
     return "unsnooze" in json.dumps(data.get("hooks", {}))
 
 
-def has_accepted_bypass(config_path: Path) -> bool:
-    """這台機器是否同意過 bypassPermissions。
+"""偵測 bypassPermissions 同意對話框用的字串。
 
-    `--permission-mode bypassPermissions` 第一次用會跳一個一次性的同意對話框,
-    接受之後才寫進 `~/.claude.json`。**沒接受過的話,守護 agent 一起來就停在那個
-    對話框上** —— 跟它原本要修的病一模一樣:無人值守的 agent 被沒人按得到的
-    對話框擋住,而 tmux 是 detached 的,不 attach 根本看不到。
+**刻意看畫面,不看 `~/.claude.json` 的 `bypassPermissionsModeAccepted`。**
+實測(claude-code 2.1.224):那個旗標是 `true`,對話框照跳 —— 拿設定檔當
+「會不會跳對話框」的代理,會在真的卡住時回報沒事,比沒有檢查更糟。
+同 CLAUDE.md 裡 `_SCOPE_LOCK` 拿輪數代理 `reviewer_seen` 那顆雷。
+"""
+_BYPASS_PROMPT = "Bypass Permissions mode"
 
-    只警告不擋,理由同 unsnooze 那段:這是機器的一次性設定問題,不是正確性問題,
-    而且要人 attach 進去按一次才解得掉 —— 起飛路徑上不該有互動問題,擋住也沒用。
-    讀不到 / 不是 JSON 一律當成沒接受過(多警告一次的代價遠小於漏警告)。
-    """
+
+def _pane_text(tmux_exe: str, name: str) -> str:
+    """抓 pane 現在的畫面;抓不到回空字串(退化成「沒看到對話框」)。"""
     try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        p = subprocess.run([tmux_exe, "capture-pane", "-p", "-t", name],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+def _accept_bypass_prompt(tmux_exe: str, name: str, tries: int = 10) -> bool:
+    """看到 bypassPermissions 的同意對話框就替它按掉,回傳有沒有按到。
+
+    這是程式**替人接受一個安全聲明**,所以兩個界線要守住:
+
+    - **只在畫面上真的有那個對話框時才送鍵。** 盲送 `2` 會打進別的東西
+      (例如 agent 正在等的一般 prompt),那就變成隨機注入。
+    - **送完要再看一次確認它消失了**,不能送完就宣告成功 —— 同
+      `new-session` 之後回頭確認 session 還在的理由。
+
+    對話框要幾百毫秒才畫出來,所以是輪詢而不是睡一個固定長度。
+    輪完都沒看到就當作沒跳過(不擋,呼叫端只是不印那句話)。
+    """
+    for _ in range(tries):
+        if _BYPASS_PROMPT in _pane_text(tmux_exe, name):
+            break
+        time.sleep(0.5)
+    else:
         return False
-    return data.get("bypassPermissionsModeAccepted") is True
+
+    # `2` 選 "Yes, I accept";選單有時要一個 Enter 才送出,多送一個是安全的
+    # (對話框已經收掉的話,那個 Enter 落在空的輸入框上,等於沒事)。
+    subprocess.call([tmux_exe, "send-keys", "-t", name, "2"])
+    time.sleep(0.5)
+    subprocess.call([tmux_exe, "send-keys", "-t", name, "Enter"])
+
+    for _ in range(tries):
+        time.sleep(0.5)
+        if _BYPASS_PROMPT not in _pane_text(tmux_exe, name):
+            return True
+    log.warning(
+        "送了同意鍵,但 bypassPermissions 的對話框還在 —— 守護 agent 仍卡著。"
+        "去按一次:tmux attach -t %s", name)
+    return False
 
 
 def session_name(config_path: str) -> str:
@@ -200,14 +239,6 @@ def run(config_path: str) -> int:
             "pipeline 本來就固定在同一台跑完,見 config 開頭的說明。)"
         )
 
-    if not has_accepted_bypass(Path.home() / ".claude.json"):
-        log.warning(
-            "這台機器還沒同意過 bypassPermissions —— 守護 agent 一起來會停在同意"
-            "對話框上,而 tmux 是 detached 的,不 attach 看不到它在等。\n"
-            "  先按一次:tmux attach -t %s 之後選 `Yes, I accept`(一次性,"
-            "之後寫進 ~/.claude.json 就不再問)。",
-            session_name(config_path))
-
     cwd = Path(config_path).resolve().parent
     for w in repo_warnings(cwd):
         log.warning(w)
@@ -249,6 +280,9 @@ def run(config_path: str) -> int:
                   "拿掉 tmux 在前景跑一次就看得到原因(例如 claude 需要先登入)。",
                   name)
         return 1
+    if _accept_bypass_prompt(tmux_exe, name):
+        log.info("已替守護 agent 按掉 bypassPermissions 的同意對話框 —— "
+                 "它是 detached 的,沒人會看到它在等。")
     log.info("守護 agent 已在背景的 tmux session `%s` 裡跑起來。\n"
              "  看它:tmux attach -t %s   (離開:ctrl+b d,不會中斷它)\n"
              "  停它:tmux kill-session -t %s", name, name, name)
