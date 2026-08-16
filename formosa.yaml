@@ -87,10 +87,16 @@ loop:
 notify:
   # park 之後 orchestrator 會 exit,沒通知就不會知道它停了。
   # desktop = 人在電腦前最即時;pr_comment = 決策紀錄留在 PR 上事後可追,
-  # 且 @mention 會走 GitHub 推播(人不在電腦前時的補位)。
-  channels: [desktop, pr_comment]
+  # 且 @mention 會走 GitHub 推播(人不在電腦前時的補位);
+  # telegram = 人不在電腦前也收得到,無人值守跑時唯一真的會被看到的那個。
+  channels: [desktop, pr_comment, telegram]
   mention: "@SP42K"
   webhook_url: ""
   webhook_format: discord
+  # 兩個都不進版控(這個 repo 是公開的):留空,吃環境變數
+  # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。token 是密鑰,chat id 是永久的
+  # 個人識別碼 —— 都不該進 git 歷史。任一個沒設就只記警告、不擋起飛。
+  telegram_token: ""
+  telegram_chat_id: ""
 
 state_file: .pipeline-state.json  # 寫進 formosa-mcp/,已加進該 repo 的 .gitignore

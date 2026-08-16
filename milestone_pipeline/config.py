@@ -21,6 +21,9 @@ NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop", "telegram"})
 # bot token 沒寫在 config 時的來源。config 多半跟 plan 一起放在目標 repo 裡,
 # 而 token 進了 yaml 就有被 commit 出去的一天 —— 環境變數是預設的走法。
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+# chat id 同理。它不是密鑰,但**是個永久的個人識別碼**,而這個 repo 是公開的
+# —— 寫進 yaml 就等於公開,且 git 歷史刪不乾淨。走環境變數。
+TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID"
 WEBHOOK_FORMATS = frozenset({"discord", "slack", "raw"})
 
 
@@ -137,15 +140,13 @@ class Config:
 
         tg_token = (noti.get("telegram_token") or ""
                     or os.environ.get(TELEGRAM_TOKEN_ENV, ""))
-        tg_chat_id = str(noti.get("telegram_chat_id") or "")
-        # chat id 缺 = 設定打錯字,在載入時就炸(同 webhook_url)。
-        # **token 缺不炸** —— 它多半來自環境變數,而同一份 config 會在不同機器 /
-        # 不同 shell 起(見 formosa.yaml 檔頭),沒設就只是這台收不到 telegram。
-        # 通知是旁路,不該讓一台沒設環境變數的機器連 pipeline 都起不來;
-        # 降級在 make_notifier(),那裡會記警告。
-        if "telegram" in channels and not tg_chat_id:
-            raise SystemExit(
-                "notify.channels 含 telegram,但沒有設定 notify.telegram_chat_id")
+        tg_chat_id = (str(noti.get("telegram_chat_id") or "")
+                      or os.environ.get(TELEGRAM_CHAT_ID_ENV, ""))
+        # **token 與 chat id 缺都不炸。** 兩個都多半來自環境變數,而同一份 config
+        # 會在不同機器 / 不同 shell 起(見 formosa.yaml 檔頭),沒設就只是這台
+        # 收不到 telegram。通知是旁路,不該讓一台沒設環境變數的機器連 pipeline
+        # 都起不來;降級在 make_notifier(),那裡會記警告。
+        # (`webhook_url` 仍然炸 —— 它只能寫在 config 裡,缺了就是設定打錯字。)
 
         return cls(
             repo_path=repo_path,

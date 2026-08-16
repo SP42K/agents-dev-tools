@@ -293,12 +293,17 @@ def make_notifier(cfg, repo_path: Path) -> Notifier:
             children.append(
                 WebhookNotifier(cfg.webhook_url, cfg.webhook_format, cfg.mention))
         elif ch == "telegram":
-            if not cfg.telegram_token:
-                # 沒 token 就整個不裝這個 channel(不是裝了之後每次 park 都 401)。
+            missing = [name for name, val in
+                       (("token(notify.telegram_token 或環境變數 "
+                         "TELEGRAM_BOT_TOKEN)", cfg.telegram_token),
+                        ("chat id(notify.telegram_chat_id 或環境變數 "
+                         "TELEGRAM_CHAT_ID)", cfg.telegram_chat_id))
+                       if not val]
+            if missing:
+                # 缺任一個就整個不裝這個 channel(不是裝了之後每次 park 都 400/401)。
                 # 這是降級不是錯誤 —— 同 OCR 沒裝、desktop 平台不支援的處理方式。
-                log.warning(
-                    "notify.channels 含 telegram,但沒有 token(notify.telegram_token "
-                    "或環境變數 TELEGRAM_BOT_TOKEN),這次跑不送 telegram 通知。")
+                log.warning("notify.channels 含 telegram,但沒有 %s,這次跑不送 "
+                            "telegram 通知。", "、也沒有 ".join(missing))
                 continue
             children.append(
                 TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id,

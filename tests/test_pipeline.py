@@ -329,28 +329,34 @@ def test_config_webhook_channel_requires_url(tmp_path):
         _cfg(tmp_path, **{"notify.channels": ["webhook"]})
 
 
-def test_config_telegram_channel_requires_chat_id(tmp_path, monkeypatch):
-    """chat id 缺 = 打錯字,炸;token 缺 = 這台沒設環境變數,不炸(降級在 make_notifier)。"""
-    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+def test_config_telegram_missing_creds_do_not_block_startup(tmp_path, monkeypatch):
+    """token / chat id 都不炸 —— 兩個都來自環境變數,而同一份 config 會在不同機器起。
+
+    通知是旁路,一台沒設環境變數的機器不該連 pipeline 都起不來。降級在
+    make_notifier()。`webhook_url` 是相反的:它只能寫在 config 裡,缺了就是打錯字。
+    """
+    from milestone_pipeline.config import TELEGRAM_CHAT_ID_ENV, TELEGRAM_TOKEN_ENV
 
     monkeypatch.delenv(TELEGRAM_TOKEN_ENV, raising=False)
-    with pytest.raises(SystemExit):
-        _cfg(tmp_path, **{"notify.channels": ["telegram"],
-                          "notify.telegram_token": "t"})
-    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
-                            "notify.telegram_chat_id": "1"})
+    monkeypatch.delenv(TELEGRAM_CHAT_ID_ENV, raising=False)
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"]})
     assert cfg.notify.telegram_token == ""
+    assert cfg.notify.telegram_chat_id == ""
 
 
-def test_config_telegram_token_falls_back_to_env(tmp_path, monkeypatch):
-    """token 不必寫進 yaml —— config 常跟 plan 一起放在目標 repo 裡。"""
-    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+def test_config_telegram_creds_fall_back_to_env(tmp_path, monkeypatch):
+    """兩個都不必寫進 yaml —— token 是密鑰,chat id 是永久的個人識別碼,repo 是公開的。"""
+    from milestone_pipeline.config import TELEGRAM_CHAT_ID_ENV, TELEGRAM_TOKEN_ENV
 
     monkeypatch.setenv(TELEGRAM_TOKEN_ENV, "from-env")
+    monkeypatch.setenv(TELEGRAM_CHAT_ID_ENV, "854590099")
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"]})
+    assert cfg.notify.telegram_token == "from-env"
+    assert cfg.notify.telegram_chat_id == "854590099"
+
+    # yaml 寫了就以 yaml 為準,且數字要轉成字串(urllib 送 JSON 時字串才安全)
     cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
                             "notify.telegram_chat_id": 12345})
-    assert cfg.notify.telegram_token == "from-env"
-    # yaml 裡的數字 chat id 要能用(urllib 送 JSON 時字串才安全)
     assert cfg.notify.telegram_chat_id == "12345"
 
 
