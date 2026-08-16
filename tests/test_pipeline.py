@@ -1135,6 +1135,11 @@ def test_guard_argv_carries_every_write_deny():
     # 擋不住 Bash 裡的 `cat > file`,但沒有 commit / push 就進不了 PR。
     assert "Write" in _DENY and "Bash(git commit:*)" in _DENY
 
+    # 沒有人會去按「允許」——ask 模式下第一個非 allowlist 的命令就掛住整條
+    # pipeline。deny 規則優先權更高,所以邊界沒有跟著鬆掉。
+    mode = argv.index("--permission-mode")
+    assert argv[mode + 1] == "bypassPermissions"
+
 
 def test_guard_argv_wraps_with_unsnooze_only_when_present():
     """unsnooze 是選用的,而且必須是 per-session 的包法(不是全域 hook)。

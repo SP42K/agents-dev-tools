@@ -129,6 +129,14 @@ def build_argv(config_path: str, claude_exe: str,
     """
     argv = [
         claude_exe,
+        # 守護 agent 沒有人在旁邊按「允許」。預設的 ask 模式下,第一個不在
+        # allowlist 裡的命令(`gh pr view`、`npm test`…)就會停在權限對話框上,
+        # 而它是為了無人值守而存在的 —— 那個對話框在這裡不是安全網,是掛住。
+        # 實測(formosa M12):agent 醒來開始驗 merge gate,第一個 `gh pr view`
+        # 就卡住,pipeline 空轉。
+        # 邊界仍然是 code 而不是 prompt:deny 規則的優先權高於權限模式,
+        # `_DENY` 照舊生效。放寬的只有「問不問」,不是「能不能」。
+        "--permission-mode", "bypassPermissions",
         "--disallowed-tools", *_DENY,
         "--append-system-prompt", prompts.GUARDIAN_SYSTEM,
         prompts.guardian_task(config_path),
