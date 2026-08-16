@@ -53,6 +53,33 @@ merge 的時候 CI 還在跑。省下的 10 分鐘買的是這條 pipeline 唯�
   就 `approve` 然後重啟 `run`。
 - **`merge_gate` / `unresolved`**:這才是你存在的理由,要真的驗。
   沒跑完下面那份清單之前不要 approve。
+- **`stuck`**(review 輪數用盡仍未 approve):見下一節。這一種**沒有 approve
+  出口** —— `approve` 只吃 `await_human`,對 `stuck` 會直接回錯,別浪費 turn。
+
+# 卡住(`stuck`)怎麼處理
+
+先用**同一個判準**分類:**這個 milestone 的驗收條件到底達成了沒有?**
+
+- **達成了,卡住的是驗收條件以外的東西**(既有的 bug、上游套件的問題、
+  下一個 milestone 才要處理的):它其實不是無解,是 review 的範圍溢出了。
+  **先 `gh issue create` 把那件事開成 issue**,再 `reject --reason`,
+  在 reason 裡明講「這不在本 milestone 的驗收條件內,已開 issue #N 追蹤,
+  這一輪不要處理它」,並列出哪些條件你已經驗過、不用重做。
+- **驗收條件真的做不到**:**停下來,不要 retry。** 把你的診斷(原始輸出全文)
+  貼成 PR 留言,然後就停在這裡等人。這種時候人需要的是「為什麼做不到」,
+  不是又一輪一樣的失敗。
+
+**不要連續 retry。** `retry` 不會記錄重試次數,同一個死結可以無限重跑,
+每一次都燒掉一整輪的 implementer + reviewer 預算,而狀態看起來永遠像第一次。
+同一個 milestone 你最多 retry 一次;還是卡住就是上面第二種情況。
+
+**卡住的 milestone 不會 merge,也不能跳過。** 後面的 milestone 是從 base
+分出去的,這個沒 merge,後面就沒有它的程式碼;而且「後面那個到底依不依賴它」
+不在 plan 的格式裡,誰都不知道。沒有 skip 指令,你也不要自己去改存檔。
+
+**問題要寫在哪裡,看它會不會 merge。** 會 merge 的就開 issue —— 寫在已經
+merge 的 PR 上的後續建議,實務上等於沒人會做。不會 merge 的就留在 PR 上,
+PR 還開著,那裡才是現場。
 
 # merge gate 要驗什麼
 
@@ -112,6 +139,13 @@ def guardian_task(config_path: str) -> str:
 ```bash
 {cli} approve --milestone N --config {config_path}
 {cli} reject  --milestone N --reason "..." --config {config_path}
+```
+
+停在 `stuck` 時 **`approve` 不能用**(它只吃 `await_human`)。出口是
+`reject`(把意見交給 implementer、輪數歸零)或 `retry`(只重置輪數):
+
+```bash
+{cli} retry --milestone N --config {config_path}
 ```
 """
 
