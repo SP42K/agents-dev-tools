@@ -175,6 +175,44 @@ fail-closed 關卡,若這裡 fail-closed,一台沒裝 `ocr` 的機器會每輪 r
 park → approve → park 無限迴圈。任何新增的關卡都要想清楚「放行後
 憑什麼不再次觸發」。
 
+**守護 agent 不能有寫入工具 —— 這是 code,不是 prompt。** `guard.py` 起的那個
+session 是 park 點上的「人」,它唯一的產出應該是 `approve` / `reject`。
+`_DENY` 分兩段:`Edit` / `Write` / `NotebookEdit` 擋掉產生檔案,
+`git commit` / `git push` / `gh pr merge` 擋掉讓檔案生效 —— **兩段都要**,
+因為前三個擋不住 Bash 裡的 `cat > file`。實測(formosa M8):只靠 prompt 時,
+守護 agent 在 merge gate 上算出「一行的事直接修比 reject 省 10 分鐘」,
+commit 進分支,那個 commit 沒經過 reviewer、沒經過 verify,merge 時 CI 還在跑。
+它讀得懂規矩,規矩當時只是文字。**新增守護 agent 的能力之前,先問這個能力能不能
+被用來繞過 reviewer 或 verify。**
+
+**守護 agent 要 tmux,orchestrator 不用 —— 兩者相反,不要抄錯。** orchestrator
+從不讀 stdin,`nohup … &` 就夠;守護 agent 是**互動 session**,而 unsnooze 的
+喚醒方式是往它的 pane 裡打字,沒有 pane 就沒有自動恢復。所以 `guard` 有 tmux
+就起在 detached session 裡。session 名字(`guard-<config stem>`)同時是身分、
+存活證明、與 attach 入口 —— **不要為了「有沒有守護 agent 在跑」另外發明 pid 檔**,
+`tmux has-session` 就是答案,而且 session 消失不留殘骸。
+
+**起飛前的檢查看「乾不乾淨」,不看「在哪個分支」。** `guard.repo_warnings()`
+警告未 commit 的變動與落後 upstream,**刻意不檢查在不在 `master` 上** ——
+在 feature branch 上開發這條 pipeline 是正常的(`guard` 自己就是),
+分支名不是「跑的 code 是不是 git 裡那份」的代理。同 `_SCOPE_LOCK` 用輪數
+代理 `reviewer_seen` 那顆雷。而且只警告不擋:起飛路徑上不該有互動問題
+(同 park & notify 的理由),要選擇就加旗標,不要加提問。
+
+**同一份存檔只能有一個 `run`,而且鎖檔要進 `_own_artifacts()`。**
+`lock.exclusive()` 用 OS 檔案鎖(不是 pid 檔:crash / `kill -9` 之後 OS 自己
+放掉,不留要人判斷的殘骸)。鎖檔跟 state 檔同一個目錄,而 state 檔多半就在
+**目標 repo 裡** —— 它是未追蹤的新檔案,不排掉的話除了讓 `workspace_fingerprint`
+每次都不一樣,連 reviewer 與 merge gate 的「`git status` 乾淨」都會被它汙染。
+任何新增的自家產物都要問一次:它會不會出現在目標 repo 的 `git status` 裡?
+
+**`unsnooze` 只能用 launcher 包法,不要 `unsnooze install`。** 後者裝的是全域
+hook,對機器上每個 claude session 生效;`unsnooze [claude args...]` 天生只包住
+守護 agent 自己(需求就是「只對守護 agent 生效」)。`guard.run()` 偵測到全域
+hook 會警告但不擋 —— 同 OCR 那段的 fail-open 理由:這是範圍問題,不是正確性問題。
+Windows 上 unsnooze 跑不起來(靠 tmux / Zellij 的 pane 恢復),降級成印警告後
+照常跑,**deny 與 prompt 兩邊仍然生效** —— 別為了 auto-resume 去弱化那兩個。
+
 **四個人工介入指令語意都不同,不要合併。**
 `retry` 卡住(輪數用盡)後重置輪數,保留 PR 與 session;
 `approve` 放行停在決策點的 milestone;
@@ -189,6 +227,7 @@ park → approve → park 無限迴圈。任何新增的關卡都要想清楚「
   `gh` / `ocr` / `verify`(各自一個外部命令的 subprocess 封裝)、
   `prompts`(所有模板)、`runner`(SDK 回應收集)、`backend`(SDK 呼叫)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
+  `guard`(守護 agent 的啟動與權限邊界)、`lock`(存檔的獨佔鎖)、
   `orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。
 - **通知失敗永遠不能中斷 pipeline。** `MultiNotifier` 會吞掉每個 channel 的

@@ -363,9 +363,20 @@ ssh host 'kill $(cat ~/pipeline.pid)'    # 中途叫停(§8)
 log **不要放 `/tmp`**(macOS 會清);PID 檔讓「merge 完就停」那招(§8)
 從任何一台機器都下得了手。
 
-**不需要 tmux。** orchestrator 從來不讀 stdin(park 是存檔 → 通知 → exit,
+**orchestrator 不需要 tmux。** 它從來不讀 stdin(park 是存檔 → 通知 → exit,
 刻意不 `input()` 等人,見 §6),所以「接上一個互動終端」在這裡是零收益 ——
 attach 就是讀那個 log,而 agent 的文字會即時落地(§5),離線期間發生的事一件不漏。
+
+**但守護 agent 需要**(§7),它剛好相反:是互動 session,而 unsnooze 的喚醒方式
+就是往它的 pane 裡打字。`guard` 會自己處理,不用你手動開 —— 別把上面那段
+`nohup … &` 套到 `guard` 上,你會得到一個沒有 TTY、ssh 一斷就死、
+unsnooze 也叫不醒的 session。
+
+**同一份存檔只能有一個 `run`。** `run` 進場會拿一個 OS 檔案鎖
+(`<state 檔>.lock`),已經有人拿著就直接停下來並告訴你。兩個 orchestrator
+併跑不會噴錯,只會互相覆蓋 `.pipeline-state.json` —— 症狀出現時已經是
+「implementer 接不回 context」或「同一個 milestone 開了兩個 PR」。
+鎖檔在 crash / `kill -9` 之後由 OS 自己放掉,沒有殘骸要清。
 
 **`session_id` 綁在跑它那台機器的 `~/.claude/projects/` 底下,不能跨機器 resume。**
 所以要換機器就在 milestone 之間換(前一個 merge 完、下一個還沒起跑),
@@ -494,6 +505,81 @@ console.log(await tool.handler({ ... }, ctx));
 描述有效得多 —— 實測一輪就修對方向。同時告訴它哪些事**不用做**(例如
 「這條驗收條件我已經驗過了」「這個案例是時段問題不是 bug,不用反覆打 API」),
 省下它的 turn 與上游額度。
+
+### 交給守護 agent 顧(無人值守)
+
+上面那份清單就是守護 agent 的工作內容 —— 它是 park 點上的那個人。
+
+```bash
+python -m milestone_pipeline guard --config formosa.yaml
+```
+
+有 tmux 的話它會**起在背景的 tmux session 裡**,名字從 config 檔名推出來
+(`formosa.yaml` → `guard-formosa`)。那個名字同時是三件事:
+
+```bash
+tmux has-session -t guard-formosa   # 有沒有守護 agent 在顧這條 pipeline
+tmux attach -t guard-formosa        # 回去看它(ctrl+b d 離開,不會中斷它)
+tmux kill-session -t guard-formosa  # 換掉它
+```
+
+**所以「先檢查有沒有」不需要另外發明 pid 檔** —— session 不在了就是不在了,
+沒有殘骸要判斷。再跑一次 `guard` 也不會開出第二個:偵測到同名 session 就
+印出 attach 指令然後退出。(兩個守護 agent 會對同一個 gate 各自下決策 ——
+一個 approve 一個 reject,而且兩個都會去重啟 `run`。)
+
+從另一台機器起飛就是普通的 ssh,不用 `nohup`,tmux 已經處理了持久化:
+
+```bash
+ssh mac 'cd ~/Documents/agents-dev-tools && \
+  .venv/bin/python -m milestone_pipeline guard --config formosa.yaml'
+```
+
+起飛前它會警告(**只警告,不擋**)工作目錄有未 commit 的變動、或落後 upstream
+—— 要防的是「跑到的 orchestrator 不是 git 裡那份」。**刻意不看在不在 `master` 上**:
+分支名不是「code 乾不乾淨」的代理(`guard` 這個功能自己就是在 feature branch
+上寫的),拿它當代理是 CLAUDE.md 裡 `_SCOPE_LOCK` 那顆雷的同一個形狀。
+
+**它被關掉了所有寫入工具**(`Edit` / `Write` / `NotebookEdit` /
+`git commit` / `git push` / `gh pr merge`,見 `guard._DENY`)。這不是保守,
+是實測過的:formosa M8 那輪,守護 agent 在 merge gate 上發現 `README.en.md`
+自相矛盾(免金鑰 tool 數一處寫 11、一處寫 9),判斷「一行的事,直接修比
+reject 跑一整輪省 10 分鐘和幾塊美金」,於是 commit 進分支。時間軸:
+
+```
+21:47:16  reviewer APPROVE
+21:47:16  orchestrator 跑 verify → 綠
+21:48:51  ← 守護 agent commit 45d74e5
+21:49:00  GitHub 才開始跑這個 sha 的 CI
+21:49:20  merge                        ← CI 還在跑
+21:49:54  CI 才結束
+```
+
+那個 commit 是唯一一個 reviewer 沒看過、verify 沒跑過、merge 時 CI 還沒結束的。
+結果沒事(內容真的改對了),但那條路徑上一道關卡都沒有。
+**它讀得懂規矩,規矩當時只是文字** —— 同 CLAUDE.md 第一條,確定性的事要留在 code 裡。
+
+擋不住的殘留:`gh issue close` / `gh pr comment` 這類不改內容的寫入還是通的
+(關掉一個已經修掉的 issue 是它該做的事),但 `--disallowed-tools` 是**權限
+deny 規則**,不是把工具拿掉 —— 語意上跟 SDK 那邊 `tools=` vs `allowed_tools`
+的差別一樣,只是互動模式下沒有 `--tools` 可用(那個旗標只吃 `--print`)。
+
+#### unsnooze:撞到用量上限之後自己接回來
+
+有裝 `unsnooze` 的話 `guard` 會自動用它包住這個 session。撞到 5 小時 / 週上限時,
+額度重置後它會喚醒守護 agent,守護 agent 再去重啟 `run` —— 兩層都恢復,
+無人值守的跑才接得下去(formosa M9 就是被
+`You've hit your session limit · resets 7:10am` 打斷、park 在 `agent_error` 的)。
+
+**不要跑 `unsnooze install`。** 那會裝全域 hook,對機器上每個 claude session 生效;
+`unsnooze [claude args...]` 這種 launcher 用法天生只包住守護 agent 自己。
+裝過的話 `guard` 啟動時會警告,用 `unsnooze uninstall` 拆掉。
+
+**Windows 上不會有 auto-resume**,unsnooze 靠 tmux / Zellij 的 pane 恢復,
+Windows 兩個都沒有 —— 沒 tmux 就退回前景跑(關掉終端就沒了),`guard` 會把
+這兩件事都印出來然後照常跑(deny 與 prompt 兩邊都是跨平台的)。
+這不影響實務:implementer 的 session_id 綁在跑它那台,pipeline 本來就固定
+在同一台跑完(見 config 開頭)。
 
 ## 8. crash / 重開機之後
 

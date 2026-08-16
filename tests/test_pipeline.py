@@ -1048,3 +1048,146 @@ def test_make_backend_refuses_a_name_it_has_not_wired_up():
     assert isinstance(make_backend("claude"), ClaudeBackend)
     with pytest.raises(SystemExit):
         make_backend("prime-agent")
+
+
+# -- 守護 agent ---------------------------------------------------------------
+
+def test_guard_argv_carries_every_write_deny():
+    """守護 agent 的價值全在「有沒有真的帶上 deny」,不能只靠人肉核對啟動指令。
+
+    實測過一次沒帶的後果:守護 agent 在 merge gate 上自己 commit 進分支,
+    那個 commit 沒經過 reviewer、沒經過 verify,merge 時 CI 還在跑。
+    """
+    from milestone_pipeline.guard import _DENY, build_argv
+    argv = build_argv("formosa.yaml", claude_exe="/usr/bin/claude")
+
+    assert argv[0] == "/usr/bin/claude"
+    flag = argv.index("--disallowed-tools")
+    for tool in _DENY:
+        assert tool in argv[flag + 1:], f"{tool} 沒有被關掉"
+
+    # 產生檔案與讓檔案生效是兩段,兩段都要擋:`--disallowed-tools Edit Write`
+    # 擋不住 Bash 裡的 `cat > file`,但沒有 commit / push 就進不了 PR。
+    assert "Write" in _DENY and "Bash(git commit:*)" in _DENY
+
+
+def test_guard_argv_wraps_with_unsnooze_only_when_present():
+    """unsnooze 是選用的,而且必須是 per-session 的包法(不是全域 hook)。
+
+    Windows 沒有 tmux,unsnooze 跑不起來 —— 那是預期中的降級,不是錯誤,
+    所以沒有它的時候要照樣組得出一個可以跑的命令列。
+    """
+    from milestone_pipeline.guard import build_argv
+    plain = build_argv("c.yaml", claude_exe="claude")
+    wrapped = build_argv("c.yaml", claude_exe="claude", unsnooze_exe="unsnooze")
+
+    assert plain[0] == "claude"
+    assert wrapped[0] == "unsnooze" and wrapped[1:] == plain
+
+
+def test_guard_spots_a_global_unsnooze_install(tmp_path):
+    """全域 hook 會讓 unsnooze 對機器上每個 session 生效,不只守護 agent。
+
+    讀不到 / 壞掉的 settings 一律當成沒裝 —— 這只是提醒,不該擋住啟動。
+    """
+    from milestone_pipeline.guard import has_global_unsnooze_hook
+    f = tmp_path / "settings.json"
+
+    f.write_text(json.dumps({"hooks": {"StopFailure": [
+        {"hooks": [{"command": "node .../unsnooze/bin/unsnooze.js _hook"}]}]}}),
+        encoding="utf-8")
+    assert has_global_unsnooze_hook(f)
+
+    f.write_text(json.dumps({"hooks": {}, "tui": "fullscreen"}), encoding="utf-8")
+    assert not has_global_unsnooze_hook(f)
+
+    f.write_text("{ not json", encoding="utf-8")
+    assert not has_global_unsnooze_hook(f)
+    assert not has_global_unsnooze_hook(tmp_path / "nope.json")
+
+
+def test_guardian_system_prompt_states_the_reject_over_fix_rule():
+    """這段文字要能獨自撐住一次「被用量上限打斷後醒來」。
+
+    prompt 不是防線(防線是 _DENY),但它是守護 agent 唯一知道「為什麼」的地方 ——
+    少了理由,下一任一樣會算出「直接修比較省」那個結論。
+    """
+    from milestone_pipeline.prompts import GUARDIAN_SYSTEM, guardian_task
+    assert "reject" in GUARDIAN_SYSTEM and "一行" in GUARDIAN_SYSTEM
+    assert "agent_error" in GUARDIAN_SYSTEM and "merge_gate" in GUARDIAN_SYSTEM
+    # 醒來時不能憑記憶接續,狀態以存檔為準
+    assert "status" in GUARDIAN_SYSTEM
+    # 決策完沒重啟 run 的話,整條 pipeline 就停在那裡
+    assert "run" in guardian_task("formosa.yaml")
+    assert "formosa.yaml" in guardian_task("formosa.yaml")
+
+
+def test_guard_session_name_is_a_stable_identity_tmux_accepts():
+    """一個名字同時是身分、存活證明、與 unsnooze 打字的目標,所以要穩定且合法。
+
+    tmux 的 session 名字不吃 `.` 與 `:`,而 config 檔名一定有 `.yaml`。
+    """
+    from milestone_pipeline.guard import session_name
+    assert session_name("formosa.yaml") == "guard-formosa"
+    assert session_name("/x/y/my-pipeline.v2.yaml") == "guard-my-pipeline-v2"
+    for bad in (".", ":"):
+        assert bad not in session_name("a.b:c.yaml")
+    # 推不出東西時也要給得出一個合法名字,不能回 "guard-"
+    assert session_name(".yaml").startswith("guard-")
+
+
+def test_guard_repo_warnings_flag_dirty_tree_not_branch_name(tmp_path):
+    """要防的是「跑到的 orchestrator 不是 git 裡那份」,不是「不在 master 上」。
+
+    分支名不是 code 乾不乾淨的代理 —— 在 feature branch 上開發這條 pipeline
+    本來就是正常的(`guard` 自己就是這樣寫出來的)。
+    """
+    from milestone_pipeline.guard import repo_warnings
+    (tmp_path / "seed.txt").write_text("x", encoding="utf-8")
+    _git_repo(tmp_path)
+    assert repo_warnings(tmp_path) == []          # 乾淨的 repo,分支叫 m1 也不該警告
+
+    (tmp_path / "seed.txt").write_text("changed", encoding="utf-8")
+    warned = repo_warnings(tmp_path)
+    assert len(warned) == 1 and "未 commit" in warned[0]
+
+    # 不是 git repo(或 git 不在)不該炸,只是沒東西可警告
+    assert repo_warnings(tmp_path / "nope") == []
+
+
+def test_run_lock_refuses_a_second_holder(tmp_path):
+    """兩個 run 併跑不會噴錯,只會互相覆蓋存檔 —— 所以要在入口擋掉。
+
+    用 OS 檔案鎖而不是 pid 檔:crash / kill -9 之後 OS 自己放掉,不留殘骸。
+    """
+    from milestone_pipeline import lock
+    state = tmp_path / ".pipeline-state.json"
+
+    with lock.exclusive(state):
+        with pytest.raises(SystemExit):
+            with lock.exclusive(state):
+                pass
+
+    # 前一個放掉之後要拿得到 —— 鎖不能是一次性的
+    with lock.exclusive(state):
+        pass
+
+
+def test_lock_file_is_excluded_from_the_workspace_fingerprint(tmp_path):
+    """鎖檔是未追蹤的新檔案,落在目標 repo 裡就會弄髒 `status --porcelain`。
+
+    不排掉的話:指紋每次都不一樣(「沒變動就不重跑」失效),而且 reviewer 與
+    merge gate 的「`git status` 乾淨」也會被它汙染。
+    """
+    from milestone_pipeline import lock
+    (tmp_path / "seed.txt").write_text("x", encoding="utf-8")
+    _git_repo(tmp_path)
+    state = tmp_path / ".pipeline-state.json"
+    ignore = [state.name, lock.lock_path(state).name]
+
+    before = workspace_fingerprint(tmp_path, ignore=ignore)
+    with lock.exclusive(state):
+        assert lock.lock_path(state).exists()
+        assert workspace_fingerprint(tmp_path, ignore=ignore) == before
+        # 沒排掉的話它確實看得見 —— 證明這個忽略項不是多餘的
+        assert workspace_fingerprint(tmp_path, ignore=[state.name]) != before

@@ -6,6 +6,10 @@
   python -m milestone_pipeline reset   [--config pipeline.yaml] [--milestone N]
   python -m milestone_pipeline approve [--config pipeline.yaml] --milestone N
   python -m milestone_pipeline reject  [--config pipeline.yaml] --milestone N --reason "..."
+  python -m milestone_pipeline guard   [--config pipeline.yaml]
+
+`guard` 起一個守護 agent 代替人顧這條 pipeline —— 它被關掉了所有寫入工具,
+只能 approve / reject(見 guard.py)。
 
 四個「人工介入」指令語意不同,不要混用:
   retry   —— 卡住(輪數用盡)後重置輪數,保留 PR 與 session
@@ -22,6 +26,7 @@ import asyncio
 import logging
 import sys
 
+from . import guard, lock
 from .config import Config
 from .notify import R_AGENT_ERROR, R_MERGE_GATE, R_UNRESOLVED
 from .orchestrator import Orchestrator, PipelineError
@@ -34,7 +39,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="milestone_pipeline")
     parser.add_argument(
         "command",
-        choices=["run", "status", "retry", "reset", "approve", "reject"],
+        choices=["run", "status", "retry", "reset", "approve", "reject", "guard"],
     )
     parser.add_argument("--config", default="pipeline.yaml")
     parser.add_argument("--milestone", type=int, default=None,
@@ -53,12 +58,17 @@ def main() -> None:
     cfg = Config.load(args.config)
 
     if args.command == "run":
-        try:
-            ok = asyncio.run(Orchestrator(cfg).run())
-        except PipelineError as e:
-            logging.getLogger("pipeline").error("%s", e)
-            sys.exit(1)
+        # 鎖圈住整段 run:兩個 orchestrator 併跑會互相覆蓋存檔(見 lock.py)。
+        with lock.exclusive(cfg.state_file):
+            try:
+                ok = asyncio.run(Orchestrator(cfg).run())
+            except PipelineError as e:
+                logging.getLogger("pipeline").error("%s", e)
+                sys.exit(1)
         sys.exit(0 if ok else 1)
+
+    elif args.command == "guard":
+        sys.exit(guard.run(args.config))
 
     elif args.command == "status":
         plan = Plan.load(cfg.plan_path)
