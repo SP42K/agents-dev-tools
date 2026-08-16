@@ -210,7 +210,7 @@ def _guards(workdir: Path) -> int:
         print(f"{workdir.resolve()} 底下沒有找到任何 pipeline config。")
         return 0
     for row in rows:
-        for line in row.lines:
+        for line in row.lines():
             print(line)
     return 1 if any(r.attention for r in rows) else 0
 

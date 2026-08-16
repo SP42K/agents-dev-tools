@@ -98,7 +98,28 @@ nohup python -m milestone_pipeline tgbot >> ~/tgbot.log 2>&1 < /dev/null &
 | `/reject <專案> <N> <理由>` | 打回,理由交給 implementer,並重啟 `run` |
 | `/retry <專案> <N>` | 輪數用盡後重置輪數,並重啟 `run` |
 
-專案名就是 config 的檔名去掉副檔名(`formosa.yaml` → `formosa`)。
+專案名就是 config 的檔名去掉副檔名(`formosa.yaml` → `formosa`)。停下來的
+pipeline 會直接附 **[✅ 放行] [❌ 打回] [🔗 PR]** 按鈕,多半不用打字;打回的理由
+用 ForceReply 收(直接回覆那則訊息)。`/` 選單由 `setMyCommands` 自動註冊。
+
+### 什麼時候才該吵你
+
+`merge_gate` 每個 milestone 都會來一次,而守護 agent 本來就會處理掉 —— 每次都推
+等於把推播練成雜訊。兩段設定分工:
+
+```yaml
+notify:
+  reasons: [stuck, agent_error, unresolved]   # 預設全部;這裡排掉 merge_gate
+  escalate_after_min: 20                      # 停這麼久還沒動 → tgbot 推一次
+```
+
+`reasons` 濾掉的**只有推播**,狀態照樣存檔、`status` / `guards` 照樣看得到。
+排掉 `merge_gate` 之後,唯一還會告訴你「守護 agent 沒把它處理掉」的就是
+`escalate_after_min` —— 那需要 `tgbot` 在跑,**不要兩個一起關**。
+
+兩個時間判斷語意不同,不要混:`guards` 的 ⚠ **不看時間**(implement 階段跑一
+小時不寫存檔是正常的);watchdog 看的是**已經停下來之後**又過了多久,那沒有
+誤報空間。
 
 **存取控制只有 `TELEGRAM_CHAT_ID` 白名單。** 這是這個 repo 唯一對外開放的入口
 (任何人知道 bot username 就能傳訊息給它),所以它跟其他 Telegram 設定的

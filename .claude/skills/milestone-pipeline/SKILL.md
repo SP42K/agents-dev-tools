@@ -629,6 +629,31 @@ nohup .venv/bin/python -m milestone_pipeline tgbot >> ~/tgbot.log 2>&1 < /dev/nu
 副檔名。**決策成功後 bot 會自己重啟 `run`**(`~/pipeline-<stem>.log`)——
 不重啟的話 approve 完 pipeline 還是停在那裡,等於沒真的從手機推動它。
 
+實際上多半不用打字:停下來的 pipeline 會直接附 **[✅ 放行] [❌ 打回] [🔗 PR]**
+按鈕(`stuck` 給的是 [▶️ 續跑],因為 `approve` 只吃 `await_human`),按完按鈕就
+收走,同一顆放行按不了第二次。打回的理由用 ForceReply 收 —— 直接回覆那則提示
+訊息就好。`/` 選單自動註冊。
+
+##### 該吵你的門檻:`notify.reasons` + `escalate_after_min`
+
+**`merge_gate` 每個 milestone 都會來一次**,而守護 agent 本來就會處理掉 ——
+每次都推等於把推播練成雜訊(實測 formosa:M11 13:07、M12 13:45、M13 15:32,
+三次都是守護 agent 自己解掉的)。所以:
+
+```yaml
+notify:
+  reasons: [stuck, agent_error, unresolved]   # 預設全部;這裡排掉 merge_gate
+  escalate_after_min: 20                      # 停這麼久還沒動 → tgbot 推一次
+```
+
+`reasons` 濾掉的**只有推播**,狀態照樣存檔、`status` / `guards` 照樣看得到。
+但排掉 `merge_gate` 之後,唯一還會告訴你「守護 agent 沒把它處理掉」的就是
+`escalate_after_min`,而它**需要 `tgbot` 在跑** —— 兩個一起關等於把那個 park
+點靜音,守護 agent 空轉你永遠不會知道(formosa M12 空轉 36 分鐘就是這個形狀)。
+
+兩個時間判斷語意不同不要混:`guards` 的 ⚠ **不看時間**(implement 階段跑一小時
+不寫存檔是正常的);watchdog 看的是**已經停下來之後**又過了多久。
+
 用 `nohup` 不用 tmux:bot 不讀 stdin,同 orchestrator 的分界(守護 agent 才需要
 tmux,因為 unsnooze 是往 pane 裡打字喚醒它的)。所以它**不會**出現在 `guards`
 的清單裡,要確認活著用 `pgrep -f "milestone_pipeline tgbot"`。

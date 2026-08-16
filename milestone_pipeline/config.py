@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .notify import (R_AGENT_ERROR, R_MERGE_GATE, R_STUCK, R_UNRESOLVED)
+
 # SDK 允許的 permission_mode(claude_agent_sdk.types.PermissionMode)
 PERMISSION_MODES = frozenset(
     {"default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"}
@@ -18,6 +20,14 @@ REVIEWER_TYPES = frozenset({"script", "actions", "hybrid"})
 # merge 前是否需要人工放行
 MERGE_GATES = frozenset({"auto", "ask"})
 NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop", "telegram"})
+# 哪些 park 原因要推通知。**預設全部**(舊行為),但實務上 `merge_gate` 每個
+# milestone 都會來一次,而守護 agent 本來就會處理掉 —— 有守護 agent 在顧的話
+# 把它排掉,推播才留給真的需要你的事。漏掉的那半(守護 agent 自己空轉)由
+# `tgbot` 的 watchdog 用 `escalate_after_min` 補,不是靠這個清單。
+# **值直接從 `notify` 借**,不要在這裡重打一份字串:它同時是
+# `MilestoneState.await_reason` 存進存檔的值,兩邊分岔的話 config 會驗過一個
+# 永遠比不中的 reason。(`notify` 只 import `gh`,不會有循環。)
+PARK_REASONS = frozenset({R_AGENT_ERROR, R_MERGE_GATE, R_STUCK, R_UNRESOLVED})
 # bot token 沒寫在 config 時的來源。config 多半跟 plan 一起放在目標 repo 裡,
 # 而 token 進了 yaml 就有被 commit 出去的一天 —— 環境變數是預設的走法。
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
@@ -94,6 +104,13 @@ class NotifyCfg:
     # telegram:token 優先讀 config,沒有就吃 TELEGRAM_TOKEN_ENV
     telegram_token: str = ""
     telegram_chat_id: str = ""
+    # 哪些 park 原因要推通知(預設全部 = 舊行為)。**這是全域的,不分 channel**
+    # —— 語意是「這件事值不值得吵人」,不是「哪個管道想收」。
+    reasons: list[str] = field(default_factory=lambda: sorted(PARK_REASONS))
+    # 停下來超過這麼久還沒動,`tgbot` 的 watchdog 就推一次(不管在不在
+    # `reasons` 裡)。把 `merge_gate` 從 `reasons` 拿掉之後,這是唯一還會
+    # 告訴你「守護 agent 沒把它處理掉」的東西 —— 不要連它一起關。
+    escalate_after_min: int = 20
 
 
 @dataclass
@@ -133,6 +150,14 @@ class Config:
             channels = [channels]
         for ch in channels:
             _one_of(ch, NOTIFY_CHANNELS, "notify.channels")
+        reasons = noti.get("reasons")
+        if reasons is None:
+            reasons = sorted(PARK_REASONS)      # 沒設 = 全部推(舊行為)
+        elif isinstance(reasons, str):
+            reasons = [reasons]
+        for r in reasons:
+            _one_of(r, PARK_REASONS, "notify.reasons")
+
         webhook_url = noti.get("webhook_url", "") or ""
         if "webhook" in channels and not webhook_url:
             # 設定錯誤在載入時就炸,不要等到流程跑一小時後才發現通知送不出去
@@ -211,6 +236,8 @@ class Config:
                 ),
                 telegram_token=tg_token,
                 telegram_chat_id=tg_chat_id,
+                reasons=list(reasons),
+                escalate_after_min=noti.get("escalate_after_min", 20),
             ),
             backend=_one_of(raw.get("backend", "claude"), BACKENDS, "backend"),
             state_file=_resolve(raw.get("state_file", ".pipeline-state.json")),

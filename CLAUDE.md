@@ -238,7 +238,23 @@ process 結束時**才重新喚醒 agent,所以 `tail -f | grep` 這種永不結
 **查 `guard.collect()` 的表而不是拼路徑**。新增任何指令之前先問:它能不能被用來
 繞過 reviewer 或 verify?(同守護 agent 那條。)
 另外 `getUpdates` 的 offset **一定要先落地再處理訊息** —— 不然處理到一半 crash,
-重啟會把 `/approve` 再吃一次。
+重啟會把 `/approve` 再吃一次。**按鈕不是比較可信的輸入**:`callback_data` 一樣是
+從網路回來的字串,`parse_callback` 要跟 `parse_command` 一樣嚴。
+
+**「該不該吵人」有兩個判斷,語意相反,不要合併。** `notify.reasons` 是**事件類型**
+的過濾(`merge_gate` 每個 milestone 都來一次、守護 agent 本來就會處理掉 → 排掉),
+`tgbot` 的 `escalate_after_min` 是**時間**的補位(排掉之後,唯一還會告訴你「守護
+agent 沒把它處理掉」的就是它)。**排掉 `merge_gate` 卻沒跑 `tgbot`,就等於把那個
+park 點靜音了** —— 加任何 `reasons` 過濾之前先問:漏掉的那半誰接?
+而 watchdog 的時間判斷與 `guards` 的 ⚠ **也不同**:`guards` 刻意不拿時間當「卡住」
+的代理(implement 跑一小時不寫存檔是正常的),watchdog 看的是**已經 park 之後**又
+過了多久 —— 停著不動沒有誤報空間。同一個「時間」在兩處意思不一樣,別互相抄。
+
+**`GuardRow` 帶資料,不帶排好的字串。** 三個消費者:`guards` 排等寬文字表、
+`tgbot` 排 HTML + 按鈕(手機是比例字體,欄位對齊在那裡是亂的)、watchdog 只讀
+`age_sec`。先排成字串再讓 tgbot 回頭解析 = 自己發明一套格式再自己解。
+`resume_verb` 也在這裡:`stuck` 只能 `retry`(`approve` 只吃 `await_human`),
+按鈕擺錯就是一顆保證失敗的按鈕,而人在手機上看不出差別。
 
 **同一份存檔只能有一個 `run`,而且鎖檔要進 `_own_artifacts()`。**
 `lock.exclusive()` 用 OS 檔案鎖(不是 pid 檔:crash / `kill -9` 之後 OS 自己

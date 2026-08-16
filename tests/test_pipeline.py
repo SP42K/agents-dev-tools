@@ -732,6 +732,42 @@ def test_multi_notifier_swallows_channel_failures():
     assert seen == [3]
 
 
+def test_notify_reasons_filters_which_parks_are_worth_pushing():
+    """`merge_gate` 每個 milestone 都會來一次,而守護 agent 本來就會處理掉。
+
+    濾掉的只有推播 —— 狀態照樣存檔,`status` / `guards` 照樣看得到。
+    真正的補位是 `tgbot` 的 watchdog(停太久沒人動才推),不是這個清單。
+    """
+    from milestone_pipeline.notify import (R_MERGE_GATE, R_STUCK,
+                                           MultiNotifier, Notifier)
+    seen = []
+
+    class Rec(Notifier):
+        def notify(self, decision):
+            seen.append(decision.reason)
+
+    n = MultiNotifier([Rec()], reasons=[R_STUCK])
+    n.notify(_decision(reason=R_MERGE_GATE))
+    assert seen == []                       # 守護 agent 的事,不吵人
+    n.notify(_decision(reason=R_STUCK))
+    assert seen == [R_STUCK]
+
+    # 沒設(None)= 全部推,維持舊行為
+    seen.clear()
+    MultiNotifier([Rec()]).notify(_decision(reason=R_MERGE_GATE))
+    assert seen == [R_MERGE_GATE]
+
+
+def test_config_validates_notify_reasons(tmp_path):
+    """reason 的值與 `MilestoneState.await_reason` 是同一組字串,打錯要當場炸。"""
+    from milestone_pipeline.config import PARK_REASONS
+    assert _cfg(tmp_path).notify.reasons == sorted(PARK_REASONS)   # 預設全部
+    cfg = _cfg(tmp_path, **{"notify.reasons": ["stuck", "agent_error"]})
+    assert cfg.notify.reasons == ["stuck", "agent_error"]
+    with pytest.raises(SystemExit):
+        _cfg(tmp_path, **{"notify.reasons": ["merge-gate"]})       # 底線寫成連字號
+
+
 def test_webhook_payload_shapes():
     from milestone_pipeline.notify import WebhookNotifier
     d = _decision()
@@ -1334,10 +1370,10 @@ def test_guards_summarize_warns_only_when_parked(tmp_path):
     # 三小時沒動,但它只是在跑 —— 不該有 ⚠,也不該多印指令
     row = summarize(p, alive=True, state=running, mtime=0.0, now=10800.0)
     assert row.attention is False
-    assert len(row.lines) == 1
-    assert "⚠" not in row.lines[0]
-    assert "guard-formosa" in row.lines[0] and "round=3" in row.lines[0]
-    assert "~$21.40" in row.lines[0] and "3 小時前" in row.lines[0]
+    assert len(row.lines()) == 1
+    assert "⚠" not in row.lines()[0]
+    assert "guard-formosa" in row.lines()[0] and "round=3" in row.lines()[0]
+    assert "~$21.40" in row.lines()[0] and "3 小時前" in row.lines()[0]
 
 
 def test_guards_summarize_parked_prints_the_commands_and_the_attach(tmp_path):
@@ -1349,8 +1385,8 @@ def test_guards_summarize_parked_prints_the_commands_and_the_attach(tmp_path):
 
     row = summarize(p, alive=True, state=state, mtime=0.0, now=60.0)
     assert row.attention is True
-    body = "\n".join(row.lines)
-    assert "⚠" in row.lines[0] and "(merge_gate)" in row.lines[0]
+    body = "\n".join(row.lines())
+    assert "⚠" in row.lines()[0] and "(merge_gate)" in row.lines()[0]
     assert "approve --milestone 2 --config shopapp.yaml" in body
     assert "reject --milestone 2" in body
     # 有守護 agent 在顧才印得出 attach 的入口
@@ -1370,7 +1406,7 @@ def test_guards_summarize_flags_parked_without_a_guard(tmp_path):
 
     row = summarize(p, alive=False, state=stuck, mtime=0.0, now=60.0)
     assert row.attention is True
-    body = "\n".join(row.lines)
+    body = "\n".join(row.lines())
     assert "沒有守護 agent 在顧" in body and "(無 guard)" in body
     # stuck 要給的是 retry(輪數用盡),不是 approve
     assert "retry --milestone 4" in body and "approve" not in body
@@ -1427,7 +1463,7 @@ def test_guards_collect_surfaces_a_broken_config_that_has_a_live_guard(
     }), encoding="utf-8")
 
     rows = guard.collect(tmp_path, now=60.0)
-    body = "\n".join(ln for r in rows for ln in r.lines)
+    body = "\n".join(ln for r in rows for ln in r.lines())
     assert "config 載入失敗" in body
     # 對不到任何 config 的 session 也要看得見(config 被改名或刪掉了)
     assert "guard-ghost" in body and "找不到對應的 config" in body
@@ -1438,7 +1474,7 @@ def test_guards_summarize_handles_a_config_that_never_ran(tmp_path):
     from milestone_pipeline.guard import summarize
     row = summarize(tmp_path / "new.yaml", alive=False, state=None,
                     mtime=None, now=60.0)
-    assert row.attention is False and "尚未開跑" in row.lines[0]
+    assert row.attention is False and "尚未開跑" in row.lines()[0]
 
 
 # -- Telegram 控制端點 --------------------------------------------------------
@@ -1504,30 +1540,39 @@ def test_tgbot_project_name_is_a_table_lookup_not_a_path(tmp_path):
         assert resolve_config(bad, rows) is None
 
 
+def _tg_msg(text, reply_to=None):
+    """造一則 Telegram update(白名單那關由呼叫端自己測)。"""
+    msg = {"chat": {"id": 1}, "text": text}
+    if reply_to:
+        msg["reply_to_message"] = {"text": reply_to}
+    return {"message": msg}
+
+
 def test_tgbot_handle_runs_the_verb_and_restarts_run(tmp_path, monkeypatch):
     """決策成功才重啟 `run`;`status` 與失敗都不該重啟。"""
     from milestone_pipeline import tgbot
     from milestone_pipeline.guard import GuardRow
     cfg = tmp_path / "formosa.yaml"
-    monkeypatch.setattr(tgbot.guard, "collect", lambda d: [GuardRow(cfg, ["x"])])
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(cfg, "guard-formosa")])
 
     calls, restarts = [], []
     monkeypatch.setattr(tgbot, "run_verb",
                         lambda p, v, m=None, r="": (calls.append((v, m, r)), (0, "ok"))[1])
     monkeypatch.setattr(tgbot, "restart_run", lambda p: restarts.append(p) or "/tmp/x.log")
 
-    reply = tgbot.handle("/approve formosa 6", tmp_path)
+    msgs = tgbot.handle(_tg_msg("/approve formosa 6"), tmp_path)
     assert calls == [("approve", 6, "")] and restarts == [cfg]
-    assert "已重啟 run" in reply
+    assert "已重啟 run" in msgs[0].text
 
     # status 只是讀,不重啟(而且它停下來時本來就 exit 1)
     restarts.clear()
     monkeypatch.setattr(tgbot, "run_verb", lambda p, v, m=None, r="": (1, "停在 M6"))
-    assert "停在 M6" in tgbot.handle("/status formosa", tmp_path)
+    assert "停在 M6" in tgbot.handle(_tg_msg("/status formosa"), tmp_path)[0].text
     assert restarts == []
 
     # 決策失敗也不重啟 —— state 沒動,重啟只會再 park 一次
-    assert "已重啟" not in tgbot.handle("/approve formosa 6", tmp_path)
+    assert "已重啟" not in tgbot.handle(_tg_msg("/approve formosa 6"), tmp_path)[0].text
     assert restarts == []
 
 
@@ -1535,9 +1580,115 @@ def test_tgbot_handle_reports_an_unknown_project(tmp_path, monkeypatch):
     from milestone_pipeline import tgbot
     from milestone_pipeline.guard import GuardRow
     monkeypatch.setattr(tgbot.guard, "collect",
-                        lambda d: [GuardRow(tmp_path / "formosa.yaml", ["x"])])
-    reply = tgbot.handle("/approve nope 1", tmp_path)
+                        lambda d: [GuardRow(tmp_path / "formosa.yaml", "guard-formosa")])
+    reply = tgbot.handle(_tg_msg("/approve nope 1"), tmp_path)[0].text
     assert "找不到專案" in reply and "formosa" in reply
+
+
+def test_tgbot_reject_button_asks_for_the_reason_then_uses_the_reply(
+        tmp_path, monkeypatch):
+    """打回的理由走 ForceReply:按鈕 → 提示 → 你回覆 → 理由接回同一個目標。
+
+    目標藏在提示訊息的文字裡(`[專案#N]`),因為 Telegram 回覆時會把原訊息帶
+    回來 —— bot 不用自己記狀態,重啟也不會忘記你在回哪一個。
+    """
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    cfg = tmp_path / "formosa.yaml"
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(cfg, "guard-formosa")])
+    calls = []
+    monkeypatch.setattr(tgbot, "run_verb",
+                        lambda p, v, m=None, r="": (calls.append((v, m, r)), (0, "ok"))[1])
+    monkeypatch.setattr(tgbot, "restart_run", lambda p: "/tmp/x.log")
+
+    # 按下「❌ 打回」→ 還沒有理由,先問
+    prompt = tgbot.do_command(tgbot.parse_callback("r:formosa:6"), tmp_path)[0]
+    assert prompt.force_reply and "[formosa#6]" in prompt.text
+    assert calls == []                      # 這一步不能真的去 reject
+
+    # 回覆那則提示 → 整段文字就是理由
+    tgbot.handle(_tg_msg("fixture 跟真實回應對不上", reply_to=prompt.text), tmp_path)
+    assert calls == [("reject", 6, "fixture 跟真實回應對不上")]
+
+
+def test_tgbot_buttons_match_the_park_reason(tmp_path):
+    """`stuck` 給「續跑」不給「放行」—— `approve` 只吃 `await_human`。
+
+    擺錯的按鈕是一顆保證失敗的按鈕,而人在手機上看不出差別。
+    """
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.state import PH_IMPLEMENT, PH_STUCK
+    from milestone_pipeline.tgbot import row_buttons
+
+    stuck = GuardRow(tmp_path / "a.yaml", "guard-a", milestone=4,
+                     phase=PH_STUCK, started=True)
+    labels = [b["text"] for row in row_buttons(stuck) for b in row]
+    assert "▶️ 續跑" in labels and "✅ 放行" not in labels
+    assert [b["callback_data"] for r in row_buttons(stuck) for b in r
+            if "callback_data" in b] == ["t:a:4", "r:a:4"]
+
+    awaiting = GuardRow(tmp_path / "a.yaml", "guard-a", milestone=2,
+                        phase=PH_AWAIT_HUMAN, started=True)
+    assert "✅ 放行" in [b["text"] for r in row_buttons(awaiting) for b in r]
+
+    # 沒停下來就沒有東西好按
+    assert row_buttons(GuardRow(tmp_path / "a.yaml", "guard-a", milestone=1,
+                                phase=PH_IMPLEMENT, started=True)) is None
+
+
+def test_tgbot_callback_data_is_parsed_as_strictly_as_typed_input():
+    """按鈕不是比較可信的輸入 —— `callback_data` 一樣是網路上回來的字串。"""
+    from milestone_pipeline.tgbot import callback_data, parse_callback
+    c = parse_callback("a:formosa:13")
+    assert (c.verb, c.project, c.milestone) == ("approve", "formosa", 13)
+    for bad in ("", "a:formosa", "x:formosa:1", "a::1", "a:formosa:x",
+                "a:formosa:1:2", "reset:formosa:1"):
+        assert parse_callback(bad) is None
+
+    # 64 bytes 是 Telegram 的硬上限:超過就不放這顆按鈕,而不是送出去被 400
+    assert callback_data("a", "formosa", 13) == "a:formosa:13"
+    assert callback_data("a", "x" * 70, 1) is None
+
+
+def test_tgbot_escalates_only_after_the_park_has_sat_too_long(tmp_path):
+    """`guards` 的 ⚠ 不看時間,watchdog 才看 —— 兩者語意不同,不要混。
+
+    watchdog 看的是「**已經停下來**之後又過了多久」,那沒有誤報空間;
+    `guards` 若拿時間當代理,implement 階段跑一小時就會被誤判成卡住。
+    """
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.state import PH_REVIEW
+    from milestone_pipeline.tgbot import escalations
+
+    def row(**kw):
+        base = dict(config=tmp_path / "formosa.yaml", session="guard-formosa",
+                    started=True, milestone=6, phase=PH_AWAIT_HUMAN,
+                    await_reason="merge_gate", escalate_after_min=20)
+        return GuardRow(**{**base, **kw})
+
+    seen = set()
+    assert escalations([row(age_sec=600)], seen) == []        # 停了 10 分鐘,還早
+    assert len(escalations([row(age_sec=1800)], seen)) == 1   # 30 分鐘 → 推
+    assert escalations([row(age_sec=3600)], seen) == []       # 同一件事不重複推
+
+    # 在跑的不推,不管多久沒寫存檔
+    assert escalations([row(phase=PH_REVIEW, await_reason=None,
+                            age_sec=99999)], set()) == []
+
+    # 同一個 milestone 換了另一種卡法 → 那是新的一件事,要推
+    assert len(escalations([row(await_reason="stuck", age_sec=1800)], seen)) == 1
+
+
+def test_tgbot_html_escapes_everything_that_came_from_outside(tmp_path):
+    """HTML 排版的代價是跳脫 —— 漏一個 `<` 整則訊息就 400 送不出去。"""
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.tgbot import render_row
+    row = GuardRow(tmp_path / "a<b>.yaml", "guard-a", started=True,
+                   milestone=1, phase="review & <fix>")
+    out = render_row(row)
+    assert "&lt;b&gt;" in out and "&amp;" in out
+    assert "<fix>" not in out
 
 
 def test_tgbot_serve_refuses_to_start_without_the_chat_id(tmp_path, monkeypatch):
