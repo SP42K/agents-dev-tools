@@ -320,13 +320,38 @@ def test_config_rejects_bad_gate_and_channel(tmp_path):
     with pytest.raises(SystemExit):
         _cfg(tmp_path, **{"loop.merge_gate": "maybe"})
     with pytest.raises(SystemExit):
-        _cfg(tmp_path, **{"notify.channels": ["telegram"]})
+        _cfg(tmp_path, **{"notify.channels": ["carrier-pigeon"]})
 
 
 def test_config_webhook_channel_requires_url(tmp_path):
     """設定錯誤要在載入時就炸,不要等流程跑一小時才發現通知送不出去。"""
     with pytest.raises(SystemExit):
         _cfg(tmp_path, **{"notify.channels": ["webhook"]})
+
+
+def test_config_telegram_channel_requires_chat_id(tmp_path, monkeypatch):
+    """chat id 缺 = 打錯字,炸;token 缺 = 這台沒設環境變數,不炸(降級在 make_notifier)。"""
+    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+
+    monkeypatch.delenv(TELEGRAM_TOKEN_ENV, raising=False)
+    with pytest.raises(SystemExit):
+        _cfg(tmp_path, **{"notify.channels": ["telegram"],
+                          "notify.telegram_token": "t"})
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
+                            "notify.telegram_chat_id": "1"})
+    assert cfg.notify.telegram_token == ""
+
+
+def test_config_telegram_token_falls_back_to_env(tmp_path, monkeypatch):
+    """token 不必寫進 yaml —— config 常跟 plan 一起放在目標 repo 裡。"""
+    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+
+    monkeypatch.setenv(TELEGRAM_TOKEN_ENV, "from-env")
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
+                            "notify.telegram_chat_id": 12345})
+    assert cfg.notify.telegram_token == "from-env"
+    # yaml 裡的數字 chat id 要能用(urllib 送 JSON 時字串才安全)
+    assert cfg.notify.telegram_chat_id == "12345"
 
 
 def test_config_accepts_single_channel_as_string(tmp_path):
@@ -717,6 +742,20 @@ def test_discord_payload_is_truncated():
     assert len(payload["content"]) <= 1900
 
 
+def test_telegram_payload_and_token_stays_out_of_errors():
+    from milestone_pipeline.notify import TelegramNotifier
+    n = TelegramNotifier("SECRET-TOKEN", "12345", mention="@SP42K")
+    payload = n._payload(_decision(detail="y" * 9000))
+    assert payload["chat_id"] == "12345"
+    assert "Milestone 3" in payload["text"]
+    # 4096 是 sendMessage 的硬上限,超過整則會被拒
+    assert len(payload["text"]) <= 4000
+    # parse_mode 不能設:body 裡的 `-` `.` `(` 會讓 MarkdownV2 回 400
+    assert "parse_mode" not in payload
+    # token 在 URL 路徑裡,絕不能出現在 payload 或錯誤訊息中
+    assert "SECRET-TOKEN" not in json.dumps(payload)
+
+
 def test_applescript_str_escapes_in_the_right_order():
     """反斜線要先跳脫 —— 顛倒的話補進去的 `\\"` 會被再跳脫一次,引號就漏出來。"""
     from milestone_pipeline.notify import _applescript_str
@@ -732,6 +771,21 @@ def test_make_notifier_returns_null_when_no_channels(tmp_path):
     from milestone_pipeline.config import NotifyCfg
     from milestone_pipeline.notify import NullNotifier, make_notifier
     assert isinstance(make_notifier(NotifyCfg(), tmp_path), NullNotifier)
+
+
+def test_make_notifier_skips_telegram_without_token(tmp_path):
+    """沒 token 就不裝這個 channel —— 不要裝了之後每次 park 都 401。"""
+    from milestone_pipeline.config import NotifyCfg
+    from milestone_pipeline.notify import (MultiNotifier, NullNotifier,
+                                           TelegramNotifier, make_notifier)
+
+    cfg = NotifyCfg(channels=["telegram"], telegram_chat_id="1")
+    assert isinstance(make_notifier(cfg, tmp_path), NullNotifier)
+
+    cfg.telegram_token = "t"
+    n = make_notifier(cfg, tmp_path)
+    assert isinstance(n, MultiNotifier)
+    assert isinstance(n.children[0], TelegramNotifier)
 
 
 # -- SDK 例外的 park 內容 ----------------------------------------------------

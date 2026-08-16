@@ -172,6 +172,35 @@ class WebhookNotifier(Notifier):
             raise RuntimeError(f"webhook HTTP {e.code}") from None
 
 
+class TelegramNotifier(WebhookNotifier):
+    """推到 Telegram bot。無人值守跑時最實用的一個 channel:人不在電腦前也收得到。
+
+    沿用 `WebhookNotifier` 的 POST 不只是省行數 —— 它的 `HTTPError` 處理
+    **刻意不把 URL 帶進錯誤訊息**,而 bot token 就在 URL 的路徑裡,
+    自己寫一份很容易把 token 漏進 log。
+
+    **不設 `parse_mode`。** `Decision.body()` 是 markdown,而 Telegram 的
+    MarkdownV2 會對沒跳脫的 `-` `.` `(` `#` 一律回 400 —— 那些字元我們每則
+    通知都有(指令、檔名、標題)。純文字送出去照樣看得懂,而且不會有一種
+    「通知靜靜地送不出去」的失敗模式。
+    """
+
+    # sendMessage 上限 4096 字元,留餘裕
+    _TG_LIMIT = 4000
+
+    def __init__(self, token: str, chat_id: str, mention: str = ""):
+        super().__init__(f"https://api.telegram.org/bot{token}/sendMessage",
+                         fmt="telegram", mention=mention)
+        self.chat_id = chat_id
+
+    def _payload(self, decision: Decision) -> dict:
+        return {
+            "chat_id": self.chat_id,
+            "text": decision.body(mention=self.mention)[:self._TG_LIMIT],
+            "disable_web_page_preview": True,
+        }
+
+
 def _applescript_str(text: str) -> str:
     """把任意文字包成 AppleScript 的字串常值(含前後引號)。
 
@@ -263,6 +292,17 @@ def make_notifier(cfg, repo_path: Path) -> Notifier:
         elif ch == "webhook":
             children.append(
                 WebhookNotifier(cfg.webhook_url, cfg.webhook_format, cfg.mention))
+        elif ch == "telegram":
+            if not cfg.telegram_token:
+                # 沒 token 就整個不裝這個 channel(不是裝了之後每次 park 都 401)。
+                # 這是降級不是錯誤 —— 同 OCR 沒裝、desktop 平台不支援的處理方式。
+                log.warning(
+                    "notify.channels 含 telegram,但沒有 token(notify.telegram_token "
+                    "或環境變數 TELEGRAM_BOT_TOKEN),這次跑不送 telegram 通知。")
+                continue
+            children.append(
+                TelegramNotifier(cfg.telegram_token, cfg.telegram_chat_id,
+                                 cfg.mention))
         elif ch == "desktop":
             children.append(DesktopNotifier())
     if not children:

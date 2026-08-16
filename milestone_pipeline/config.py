@@ -1,6 +1,7 @@
 """載入與驗證 pipeline.yaml。"""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +17,10 @@ BACKENDS = frozenset({"claude"})
 REVIEWER_TYPES = frozenset({"script", "actions", "hybrid"})
 # merge 前是否需要人工放行
 MERGE_GATES = frozenset({"auto", "ask"})
-NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop"})
+NOTIFY_CHANNELS = frozenset({"pr_comment", "webhook", "desktop", "telegram"})
+# bot token 沒寫在 config 時的來源。config 多半跟 plan 一起放在目標 repo 裡,
+# 而 token 進了 yaml 就有被 commit 出去的一天 —— 環境變數是預設的走法。
+TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 WEBHOOK_FORMATS = frozenset({"discord", "slack", "raw"})
 
 
@@ -84,6 +88,9 @@ class NotifyCfg:
     mention: str = ""            # 例如 "@SP42K",會放在通知開頭觸發推播
     webhook_url: str = ""
     webhook_format: str = "discord"
+    # telegram:token 優先讀 config,沒有就吃 TELEGRAM_TOKEN_ENV
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
 
 
 @dataclass
@@ -127,6 +134,18 @@ class Config:
         if "webhook" in channels and not webhook_url:
             # 設定錯誤在載入時就炸,不要等到流程跑一小時後才發現通知送不出去
             raise SystemExit("notify.channels 含 webhook,但沒有設定 notify.webhook_url")
+
+        tg_token = (noti.get("telegram_token") or ""
+                    or os.environ.get(TELEGRAM_TOKEN_ENV, ""))
+        tg_chat_id = str(noti.get("telegram_chat_id") or "")
+        # chat id 缺 = 設定打錯字,在載入時就炸(同 webhook_url)。
+        # **token 缺不炸** —— 它多半來自環境變數,而同一份 config 會在不同機器 /
+        # 不同 shell 起(見 formosa.yaml 檔頭),沒設就只是這台收不到 telegram。
+        # 通知是旁路,不該讓一台沒設環境變數的機器連 pipeline 都起不來;
+        # 降級在 make_notifier(),那裡會記警告。
+        if "telegram" in channels and not tg_chat_id:
+            raise SystemExit(
+                "notify.channels 含 telegram,但沒有設定 notify.telegram_chat_id")
 
         return cls(
             repo_path=repo_path,
@@ -189,6 +208,8 @@ class Config:
                     WEBHOOK_FORMATS,
                     "notify.webhook_format",
                 ),
+                telegram_token=tg_token,
+                telegram_chat_id=tg_chat_id,
             ),
             backend=_one_of(raw.get("backend", "claude"), BACKENDS, "backend"),
             state_file=_resolve(raw.get("state_file", ".pipeline-state.json")),

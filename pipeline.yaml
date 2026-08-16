@@ -67,10 +67,15 @@ loop:
   verify_timeout_sec: 900
 
 notify:
-  channels: []                    # pr_comment | webhook | desktop,可多選;空 = 不通知
+  channels: []                    # pr_comment | webhook | desktop | telegram,可多選;空 = 不通知
   mention: ""                     # 例如 "@SP42K",放在通知開頭觸發 GitHub 推播
   webhook_url: ""                 # Discord / Slack incoming webhook(選 webhook 時必填)
   webhook_format: discord         # discord | slack | raw
+  # telegram:token 留空就吃環境變數 TELEGRAM_BOT_TOKEN ——
+  # 這個檔常跟 plan 一起放在目標 repo 裡,token 寫進來就有被 commit 出去的一天。
+  # 兩邊都沒有時只記警告、不送 telegram(不擋起飛);chat_id 沒填則會直接炸。
+  telegram_token: ""
+  telegram_chat_id: ""            # 選 telegram 時必填(私訊給自己就是自己的 user id)
 
 backend: claude                   # 兩個 agent 跑在哪個 runtime 上(見 backend.py)。
                                   # 目前只有 claude 一種,這行不寫也是它。
