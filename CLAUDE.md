@@ -175,6 +175,23 @@ fail-closed 關卡,若這裡 fail-closed,一台沒裝 `ocr` 的機器會每輪 r
 park → approve → park 無限迴圈。任何新增的關卡都要想清楚「放行後
 憑什麼不再次觸發」。
 
+**守護 agent 不能有寫入工具 —— 這是 code,不是 prompt。** `guard.py` 起的那個
+session 是 park 點上的「人」,它唯一的產出應該是 `approve` / `reject`。
+`_DENY` 分兩段:`Edit` / `Write` / `NotebookEdit` 擋掉產生檔案,
+`git commit` / `git push` / `gh pr merge` 擋掉讓檔案生效 —— **兩段都要**,
+因為前三個擋不住 Bash 裡的 `cat > file`。實測(formosa M8):只靠 prompt 時,
+守護 agent 在 merge gate 上算出「一行的事直接修比 reject 省 10 分鐘」,
+commit 進分支,那個 commit 沒經過 reviewer、沒經過 verify,merge 時 CI 還在跑。
+它讀得懂規矩,規矩當時只是文字。**新增守護 agent 的能力之前,先問這個能力能不能
+被用來繞過 reviewer 或 verify。**
+
+**`unsnooze` 只能用 launcher 包法,不要 `unsnooze install`。** 後者裝的是全域
+hook,對機器上每個 claude session 生效;`unsnooze [claude args...]` 天生只包住
+守護 agent 自己(需求就是「只對守護 agent 生效」)。`guard.run()` 偵測到全域
+hook 會警告但不擋 —— 同 OCR 那段的 fail-open 理由:這是範圍問題,不是正確性問題。
+Windows 上 unsnooze 跑不起來(靠 tmux / Zellij 的 pane 恢復),降級成印警告後
+照常跑,**deny 與 prompt 兩邊仍然生效** —— 別為了 auto-resume 去弱化那兩個。
+
 **四個人工介入指令語意都不同,不要合併。**
 `retry` 卡住(輪數用盡)後重置輪數,保留 PR 與 session;
 `approve` 放行停在決策點的 milestone;
@@ -189,7 +206,7 @@ park → approve → park 無限迴圈。任何新增的關卡都要想清楚「
   `gh` / `ocr` / `verify`(各自一個外部命令的 subprocess 封裝)、
   `prompts`(所有模板)、`runner`(SDK 回應收集)、`backend`(SDK 呼叫)、
   `implementer`/`reviewer`(agent 封裝)、`notify`(決策通知)、
-  `orchestrator`(主迴圈)。
+  `guard`(守護 agent 的啟動與權限邊界)、`orchestrator`(主迴圈)。
   prompt 文字一律放 `prompts.py`,不要散在 agent 模組裡。
 - **通知失敗永遠不能中斷 pipeline。** `MultiNotifier` 會吞掉每個 channel 的
   例外並記 log:狀態早就存檔了,人就算沒收到推播,`status` 也看得到。

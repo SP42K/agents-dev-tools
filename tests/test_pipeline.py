@@ -1048,3 +1048,75 @@ def test_make_backend_refuses_a_name_it_has_not_wired_up():
     assert isinstance(make_backend("claude"), ClaudeBackend)
     with pytest.raises(SystemExit):
         make_backend("prime-agent")
+
+
+# -- 守護 agent ---------------------------------------------------------------
+
+def test_guard_argv_carries_every_write_deny():
+    """守護 agent 的價值全在「有沒有真的帶上 deny」,不能只靠人肉核對啟動指令。
+
+    實測過一次沒帶的後果:守護 agent 在 merge gate 上自己 commit 進分支,
+    那個 commit 沒經過 reviewer、沒經過 verify,merge 時 CI 還在跑。
+    """
+    from milestone_pipeline.guard import _DENY, build_argv
+    argv = build_argv("formosa.yaml", claude_exe="/usr/bin/claude")
+
+    assert argv[0] == "/usr/bin/claude"
+    flag = argv.index("--disallowed-tools")
+    for tool in _DENY:
+        assert tool in argv[flag + 1:], f"{tool} 沒有被關掉"
+
+    # 產生檔案與讓檔案生效是兩段,兩段都要擋:`--disallowed-tools Edit Write`
+    # 擋不住 Bash 裡的 `cat > file`,但沒有 commit / push 就進不了 PR。
+    assert "Write" in _DENY and "Bash(git commit:*)" in _DENY
+
+
+def test_guard_argv_wraps_with_unsnooze_only_when_present():
+    """unsnooze 是選用的,而且必須是 per-session 的包法(不是全域 hook)。
+
+    Windows 沒有 tmux,unsnooze 跑不起來 —— 那是預期中的降級,不是錯誤,
+    所以沒有它的時候要照樣組得出一個可以跑的命令列。
+    """
+    from milestone_pipeline.guard import build_argv
+    plain = build_argv("c.yaml", claude_exe="claude")
+    wrapped = build_argv("c.yaml", claude_exe="claude", unsnooze_exe="unsnooze")
+
+    assert plain[0] == "claude"
+    assert wrapped[0] == "unsnooze" and wrapped[1:] == plain
+
+
+def test_guard_spots_a_global_unsnooze_install(tmp_path):
+    """全域 hook 會讓 unsnooze 對機器上每個 session 生效,不只守護 agent。
+
+    讀不到 / 壞掉的 settings 一律當成沒裝 —— 這只是提醒,不該擋住啟動。
+    """
+    from milestone_pipeline.guard import has_global_unsnooze_hook
+    f = tmp_path / "settings.json"
+
+    f.write_text(json.dumps({"hooks": {"StopFailure": [
+        {"hooks": [{"command": "node .../unsnooze/bin/unsnooze.js _hook"}]}]}}),
+        encoding="utf-8")
+    assert has_global_unsnooze_hook(f)
+
+    f.write_text(json.dumps({"hooks": {}, "tui": "fullscreen"}), encoding="utf-8")
+    assert not has_global_unsnooze_hook(f)
+
+    f.write_text("{ not json", encoding="utf-8")
+    assert not has_global_unsnooze_hook(f)
+    assert not has_global_unsnooze_hook(tmp_path / "nope.json")
+
+
+def test_guardian_system_prompt_states_the_reject_over_fix_rule():
+    """這段文字要能獨自撐住一次「被用量上限打斷後醒來」。
+
+    prompt 不是防線(防線是 _DENY),但它是守護 agent 唯一知道「為什麼」的地方 ——
+    少了理由,下一任一樣會算出「直接修比較省」那個結論。
+    """
+    from milestone_pipeline.prompts import GUARDIAN_SYSTEM, guardian_task
+    assert "reject" in GUARDIAN_SYSTEM and "一行" in GUARDIAN_SYSTEM
+    assert "agent_error" in GUARDIAN_SYSTEM and "merge_gate" in GUARDIAN_SYSTEM
+    # 醒來時不能憑記憶接續,狀態以存檔為準
+    assert "status" in GUARDIAN_SYSTEM
+    # 決策完沒重啟 run 的話,整條 pipeline 就停在那裡
+    assert "run" in guardian_task("formosa.yaml")
+    assert "formosa.yaml" in guardian_task("formosa.yaml")

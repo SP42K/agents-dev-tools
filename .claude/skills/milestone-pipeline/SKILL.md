@@ -495,6 +495,54 @@ console.log(await tool.handler({ ... }, ctx));
 「這條驗收條件我已經驗過了」「這個案例是時段問題不是 bug,不用反覆打 API」),
 省下它的 turn 與上游額度。
 
+### 交給守護 agent 顧(無人值守)
+
+上面那份清單就是守護 agent 的工作內容 —— 它是 park 點上的那個人。
+
+```bash
+python -m milestone_pipeline guard --config formosa.yaml
+```
+
+**它被關掉了所有寫入工具**(`Edit` / `Write` / `NotebookEdit` /
+`git commit` / `git push` / `gh pr merge`,見 `guard._DENY`)。這不是保守,
+是實測過的:formosa M8 那輪,守護 agent 在 merge gate 上發現 `README.en.md`
+自相矛盾(免金鑰 tool 數一處寫 11、一處寫 9),判斷「一行的事,直接修比
+reject 跑一整輪省 10 分鐘和幾塊美金」,於是 commit 進分支。時間軸:
+
+```
+21:47:16  reviewer APPROVE
+21:47:16  orchestrator 跑 verify → 綠
+21:48:51  ← 守護 agent commit 45d74e5
+21:49:00  GitHub 才開始跑這個 sha 的 CI
+21:49:20  merge                        ← CI 還在跑
+21:49:54  CI 才結束
+```
+
+那個 commit 是唯一一個 reviewer 沒看過、verify 沒跑過、merge 時 CI 還沒結束的。
+結果沒事(內容真的改對了),但那條路徑上一道關卡都沒有。
+**它讀得懂規矩,規矩當時只是文字** —— 同 CLAUDE.md 第一條,確定性的事要留在 code 裡。
+
+擋不住的殘留:`gh issue close` / `gh pr comment` 這類不改內容的寫入還是通的
+(關掉一個已經修掉的 issue 是它該做的事),但 `--disallowed-tools` 是**權限
+deny 規則**,不是把工具拿掉 —— 語意上跟 SDK 那邊 `tools=` vs `allowed_tools`
+的差別一樣,只是互動模式下沒有 `--tools` 可用(那個旗標只吃 `--print`)。
+
+#### unsnooze:撞到用量上限之後自己接回來
+
+有裝 `unsnooze` 的話 `guard` 會自動用它包住這個 session。撞到 5 小時 / 週上限時,
+額度重置後它會喚醒守護 agent,守護 agent 再去重啟 `run` —— 兩層都恢復,
+無人值守的跑才接得下去(formosa M9 就是被
+`You've hit your session limit · resets 7:10am` 打斷、park 在 `agent_error` 的)。
+
+**不要跑 `unsnooze install`。** 那會裝全域 hook,對機器上每個 claude session 生效;
+`unsnooze [claude args...]` 這種 launcher 用法天生只包住守護 agent 自己。
+裝過的話 `guard` 啟動時會警告,用 `unsnooze uninstall` 拆掉。
+
+**Windows 上不會有 auto-resume**,unsnooze 靠 tmux / Zellij 的 pane 恢復,
+Windows 沒有。`guard` 會印警告然後照常跑(deny 與 prompt 兩邊都是跨平台的)。
+這不影響實務:implementer 的 session_id 綁在跑它那台,pipeline 本來就固定
+在同一台跑完(見 config 開頭)。
+
 ## 8. crash / 重開機之後
 
 狀態每一步都存檔,所以 crash 是可以續跑的 —— 但要先分清楚**存到哪一步**:
