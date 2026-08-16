@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import subprocess
@@ -1533,7 +1534,7 @@ def test_tgbot_project_name_is_a_table_lookup_not_a_path(tmp_path):
     from milestone_pipeline.guard import GuardRow
     from milestone_pipeline.tgbot import resolve_config
     good = tmp_path / "formosa.yaml"
-    rows = [GuardRow(good, ["..."]), GuardRow(None, ["孤兒 session"])]
+    rows = [GuardRow(good, "guard-formosa"), GuardRow(None, "guard-ghost")]
 
     assert resolve_config("formosa", rows) == good
     for bad in ("../../etc/passwd", "formosa.yaml", "/etc/passwd", "nope", ""):
@@ -1610,6 +1611,21 @@ def test_tgbot_reject_button_asks_for_the_reason_then_uses_the_reply(
     # 回覆那則提示 → 整段文字就是理由
     tgbot.handle(_tg_msg("fixture 跟真實回應對不上", reply_to=prompt.text), tmp_path)
     assert calls == [("reject", 6, "fixture 跟真實回應對不上")]
+
+
+@pytest.mark.parametrize("stem", ["a&b", "福爾摩沙", "my.proj-2"])
+def test_tgbot_reply_target_survives_any_legal_config_stem(stem):
+    """`[專案#N]` 標記要吃得下任何合法的 config 檔名,不然打回會靜靜失效。
+
+    `&` 出去時被 `_esc` 換成 `&amp;`(Telegram 回來時可能已還原、也可能沒有),
+    CJK 則從頭到尾不在 ASCII 白名單裡 —— 兩種都對不回 stem 就等於按鈕壞掉。
+    驗證不在這裡,在 `resolve_config` 的查表(見上一個測試)。
+    """
+    from milestone_pipeline import tgbot
+    quoted = tgbot.reject_prompt(stem, 6).text
+    assert tgbot.reply_target(_tg_msg("理由", reply_to=quoted)) == (stem, 6)
+    assert tgbot.reply_target(
+        _tg_msg("理由", reply_to=html.unescape(quoted))) == (stem, 6)
 
 
 def test_tgbot_buttons_match_the_park_reason(tmp_path):

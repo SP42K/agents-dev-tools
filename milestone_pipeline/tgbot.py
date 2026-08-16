@@ -88,8 +88,11 @@ _DECISIONS = _NEEDS_MILESTONE
 # 按鈕 → verb。callback_data 有 64 bytes 上限,所以用單字母。
 _CALLBACK_VERBS = {"a": "approve", "t": "retry", "r": "reject"}
 # 「回覆這則訊息寫下理由」的目標藏在提示訊息的文字裡(Telegram 會把原訊息
-# 一起回傳),所以要一個機器讀得回來的標記。字元集刻意收窄。
-_TARGET_RE = re.compile(r"\[([0-9A-Za-z_.-]{1,64})#(\d{1,6})\]")
+# 一起回傳),所以要一個機器讀得回來的標記。專案名這一段吃「除了 `#` 以外的任何
+# 字元」**不是**放寬驗證:白名單擋不住的是 CJK 或含 `&` 的檔名(那是合法的
+# config stem),擋下來只會讓打回靜靜失效。真正的關卡在 `resolve_config` ——
+# 它查 `guard.collect()` 那張表,對不到 stem 就是對不到,沒有拼路徑的餘地。
+_TARGET_RE = re.compile(r"\[([^#]{1,64})#(\d{1,6})\]")
 
 
 @dataclass
@@ -191,7 +194,9 @@ def reply_target(update: dict) -> tuple[str, int] | None:
     """這則訊息是不是在回覆我們的「寫下理由」提示?是的話回 (專案, milestone)。"""
     quoted = (((update.get("message") or {}).get("reply_to_message") or {})
               .get("text") or "")
-    m = _TARGET_RE.search(quoted)
+    # 先還原 HTML entity:`reject_prompt` 送出去的是 `_esc(project)`,含 `&`
+    # 的專案名回來時是 `&amp;`,不還原就對不回 config 的 stem。
+    m = _TARGET_RE.search(html.unescape(quoted))
     return (m.group(1), int(m.group(2))) if m else None
 
 
@@ -399,8 +404,6 @@ def render_guards(rows: list[guard.GuardRow]) -> list[Msg]:
     out = []
     if quiet:
         out.append(Msg(f"\n{_SEP}\n".join(render_row(r) for r in quiet)))
-    elif not any(r.parked for r in rows):
-        out.append(Msg("沒有找到任何 pipeline config。"))
     for row in rows:
         if row.parked:
             out.append(Msg(render_row(row), buttons=row_buttons(row, _pr_url(row))))
