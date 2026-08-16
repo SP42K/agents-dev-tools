@@ -7,3 +7,7 @@ build/
 dist/
 .pytest_cache/
 .pipeline-state.json
+# tgbot 的 getUpdates 進度。它落在這個 repo 裡,而 guard.repo_warnings() 看的
+# 就是 `git status --porcelain` —— 不排掉的話每次起守護 agent 都會警告「有未
+# commit 的變動」。
+.mp-tgbot-offset

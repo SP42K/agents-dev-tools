@@ -272,10 +272,19 @@ class DesktopNotifier(Notifier):
 class MultiNotifier(Notifier):
     """依序送到所有 channel。單一 channel 失敗不影響其他,也不影響主流程。"""
 
-    def __init__(self, children: list[Notifier]):
+    def __init__(self, children: list[Notifier],
+                 reasons: list[str] | None = None):
         self.children = children
+        # 哪些 park 原因值得吵人。`None` = 全部(舊行為)。**過濾在這裡而不是
+        # 在每個 channel 裡**:語意是「這件事值不值得推播」,與管道無關。
+        # 被濾掉的仍然照常存檔、照常寫 log —— 少的只有推播。
+        self.reasons = set(reasons) if reasons is not None else None
 
     def notify(self, decision: Decision) -> None:
+        if self.reasons is not None and decision.reason not in self.reasons:
+            log.info("park 原因 %s 不在 notify.reasons 裡,不推播"
+                     "(狀態已存檔,`status` / `guards` 看得到)。", decision.reason)
+            return
         for child in self.children:
             try:
                 child.notify(decision)
@@ -312,4 +321,4 @@ def make_notifier(cfg, repo_path: Path) -> Notifier:
             children.append(DesktopNotifier())
     if not children:
         return NullNotifier()
-    return MultiNotifier(children)
+    return MultiNotifier(children, getattr(cfg, "reasons", None))

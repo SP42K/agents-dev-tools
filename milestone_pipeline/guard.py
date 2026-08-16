@@ -24,7 +24,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import prompts
@@ -312,10 +312,89 @@ _NO_GUARD = "(無 guard)"
 
 @dataclass
 class GuardRow:
-    """一條 pipeline 在 `guards` 輸出裡佔的那幾行。"""
-    config: Path | None                              # None = 對不到 config 的孤兒 session
-    lines: list[str] = field(default_factory=list)
-    attention: bool = False                          # 需要人看一眼 → exit code 1
+    """一條 pipeline 現在的狀態。**帶資料,不是排好的字串。**
+
+    三個消費者各自排版:`guards` 排文字表、`tgbot` 排 HTML + 按鈕、
+    `tgbot` 的 watchdog 只讀 `age_sec` 判斷卡多久。把字串先排好再讓 tgbot
+    回頭解析等於自己發明一套格式再自己解 —— 資料留著,排版各自做。
+    """
+    config: Path | None                # None = 對不到 config 的孤兒 session
+    session: str                       # tmux session 名字(不管活著沒)
+    repo: Path | None = None           # 目標 repo,tgbot 拿它去問 PR 網址
+    alive: bool = False
+    started: bool = False              # 有存檔 = 跑過
+    milestone: int | None = None
+    phase: str = ""
+    review_round: int = 0
+    cost_usd: float = 0.0
+    pr_number: int | None = None
+    await_reason: str | None = None
+    age_sec: float | None = None       # 存檔多久沒動;None = 沒有存檔
+    problem: str = ""                  # config 載不起來 / 孤兒 session 的說明
+    escalate_after_min: int = 20       # 停這麼久還沒動就升級推播(tgbot watchdog)
+
+    @property
+    def project(self) -> str:
+        """指令與 callback 用的識別:config 檔名去掉副檔名。"""
+        return self.config.stem if self.config else ""
+
+    @property
+    def parked(self) -> bool:
+        return self.phase in (PH_STUCK, PH_AWAIT_HUMAN)
+
+    @property
+    def attention(self) -> bool:
+        """需要人看一眼 → `guards` 的 exit code 1。"""
+        return self.parked or bool(self.problem)
+
+    @property
+    def age(self) -> str:
+        return _ago(self.age_sec) if self.age_sec is not None else "—"
+
+    @property
+    def resume_verb(self) -> str:
+        """從這個 park 點恢復要用哪個指令。
+
+        `stuck` 是輪數用盡,`approve` 吃不下(它只認 `await_human`)—— 出口是
+        `retry`。搞錯的話人會在手機上按到一個一定失敗的按鈕。
+        """
+        return "approve" if self.phase == PH_AWAIT_HUMAN else "retry"
+
+    def summary(self) -> str:
+        """一行摘要(不含 session / 檔名那兩欄,tgbot 也用這個)。"""
+        if self.problem:
+            return f"⚠ {self.problem}"
+        if not self.started:
+            return "尚未開跑"
+        bits = [f"M{self.milestone} {self.phase}"]
+        if self.await_reason:
+            bits.append(f"({self.await_reason})")
+        if self.review_round:
+            bits.append(f"round={self.review_round}")
+        if self.cost_usd:
+            bits.append(f"~${self.cost_usd:.2f}")
+        bits.append(self.age)
+        if self.parked:
+            bits.append("⚠" if self.alive else "⚠ 沒有守護 agent 在顧")
+        return "  ".join(bits)
+
+    def lines(self) -> list[str]:
+        """`guards` 的文字輸出(終端機是等寬字,所以這裡才對得起欄位)。"""
+        who = self.session if self.alive else _NO_GUARD
+        name = self.config.name if self.config else ""
+        out = [f"{who:<16}{name:<18}{self.summary()}"]
+        if not self.parked or not self.config:
+            return out
+        # 停下來的話把指令一起印出來,不用去翻 `status`(同 `status` 的作法)。
+        tail = f"--config {self.config.name}"
+        label = "放行" if self.resume_verb == "approve" else "續跑"
+        out.append(f"    {label}: {_CLI} {self.resume_verb} "
+                   f"--milestone {self.milestone} {tail}")
+        out.append(f"    打回: {_CLI} reject --milestone {self.milestone} "
+                   f'--reason "..." {tail}')
+        if self.alive:
+            out.append(f"    看它: tmux attach -r -t {self.session}")
+        return out
 
 
 def list_sessions(tmux_exe: str) -> list[str]:
@@ -342,55 +421,40 @@ def _ago(seconds: float) -> str:
 
 
 def summarize(config_path: Path, alive: bool, state: PipelineState | None,
-              mtime: float | None, now: float) -> GuardRow:
-    """把一條 pipeline 排成要印的那幾行。**純函式,不碰檔案系統**(才測得到)。
+              mtime: float | None, now: float,
+              repo: Path | None = None) -> GuardRow:
+    """把一條 pipeline 的存檔整理成一列。**純函式,不碰檔案系統**(才測得到)。
 
     ⚠ 只給「停在 `stuck` / `await_human`」。**刻意不設「多久沒動就算卡住」的
     門檻** —— implement 階段跑一小時不寫 state 是正常的,任何時間門檻都會誤報;
     時間照印但不拿來判斷,留給人看。同 `repo_warnings` 不拿分支名當「code 乾不
-    乾淨」的代理。
+    乾淨」的代理。(真正的「卡住」由 `tgbot` 的 watchdog 用時間判斷 —— 那裡的
+    語意不同:它看的是**停下來之後**過了多久,不是「有沒有在寫存檔」。)
 
     同理**「沒有 guard session」本身不算問題** —— `nohup … run` 不配守護 agent
     是既有的正常跑法(見 formosa.yaml 檔頭)。只有「停下來等人**而且**沒有守護
     agent 會去按」才值得警告,那才是真的沒人會來。
     """
-    name = session_name(str(config_path))
-    head = f"{name if alive else _NO_GUARD:<16}{config_path.name:<18}"
-    # `is not None`:mtime 是 epoch 秒數,`if mtime` 會把 0.0 當成「沒有」
-    age = _ago(now - mtime) if mtime is not None else "—"
-
+    row = GuardRow(
+        config=config_path,
+        session=session_name(str(config_path)),
+        repo=repo,
+        alive=alive,
+        # `is not None`:mtime 是 epoch 秒數,`if mtime` 會把 0.0 當成「沒有」
+        age_sec=(now - mtime) if mtime is not None else None,
+    )
     if state is None:
-        return GuardRow(config_path, [f"{head}尚未開跑"])
-
-    ms = state.milestones.get(str(state.current))
-    phase = ms.phase if ms else "pending"
-    paused = phase in (PH_STUCK, PH_AWAIT_HUMAN)
-
-    bits = [f"M{state.current} {phase}"]
-    if ms and ms.await_reason:
-        bits.append(f"({ms.await_reason})")
-    if ms and ms.review_round:
-        bits.append(f"round={ms.review_round}")
-    if ms and ms.cost_usd:
-        bits.append(f"~${ms.cost_usd:.2f}")
-    bits.append(age)
-    if paused:
-        bits.append("⚠" if alive else "⚠ 沒有守護 agent 在顧")
-
-    row = GuardRow(config_path, [head + "  ".join(bits)], paused)
-    if not paused:
         return row
 
-    # 停下來的話把指令一起印出來,不用去翻 `status`(同 `status` 的作法)。
-    tail = f"--config {config_path.name}"
-    n = state.current
-    if phase == PH_AWAIT_HUMAN:
-        row.lines.append(f"    放行: {_CLI} approve --milestone {n} {tail}")
-    else:
-        row.lines.append(f"    續跑: {_CLI} retry --milestone {n} {tail}")
-    row.lines.append(f'    打回: {_CLI} reject --milestone {n} --reason "..." {tail}')
-    if alive:
-        row.lines.append(f"    看它: tmux attach -r -t {name}")
+    ms = state.milestones.get(str(state.current))
+    row.started = True
+    row.milestone = state.current
+    row.phase = ms.phase if ms else "pending"
+    if ms:
+        row.review_round = ms.review_round
+        row.cost_usd = ms.cost_usd
+        row.pr_number = ms.pr_number
+        row.await_reason = ms.await_reason
     return row
 
 
@@ -419,8 +483,8 @@ def collect(workdir: Path, now: float | None = None) -> list[GuardRow]:
             # 那份 repo.path 是佔位字串的範本),所以沒有 session 對到就安靜略過;
             # 有 session 對到卻載不起來才是真的壞了,那要看得見。
             if alive:
-                rows.append(GuardRow(
-                    p, [f"{name:<16}{p.name:<18}⚠ config 載入失敗: {e}"], True))
+                rows.append(GuardRow(p, name, alive=True,
+                                     problem=f"config 載入失敗: {e}"))
             continue
 
         sf = cfg.state_file
@@ -431,10 +495,12 @@ def collect(workdir: Path, now: float | None = None) -> list[GuardRow]:
         except (OSError, ValueError) as e:
             log.warning("讀不到 %s 的存檔 %s:%s", p.name, sf, e)
             state, mtime = None, None
-        rows.append(summarize(p, alive, state, mtime, now))
+        row = summarize(p, alive, state, mtime, now, repo=cfg.repo_path)
+        row.escalate_after_min = cfg.notify.escalate_after_min
+        rows.append(row)
 
     # 對不到 config 的 guard session:config 改名或刪掉了,而那個守護 agent 還在跑。
     for name in sorted(s for s in sessions - claimed if s.startswith("guard-")):
-        rows.append(GuardRow(
-            None, [f"{name:<16}⚠ 找不到對應的 config(改名或刪掉了?)"], True))
+        rows.append(GuardRow(None, name, alive=True,
+                             problem="找不到對應的 config(改名或刪掉了?)"))
     return rows
