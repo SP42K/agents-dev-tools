@@ -399,10 +399,12 @@ ccgram Telegram)。**但它的 Windows 支援仍標示 beta**,本機是 Windows 
 # 長時間跑,丟背景並導向 log
 python -m milestone_pipeline run --config target.yaml >> /tmp/pipeline.log 2>&1
 
-python -m milestone_pipeline status --config target.yaml   # 看進度
+python -m milestone_pipeline status --config target.yaml   # 看進度(單一專案)
+python -m milestone_pipeline guards                        # 全部專案一行一條
 ```
 
-exit code:`0` = 全部完成;`1` = 停下來等人或流程錯誤。
+exit code:`0` = 全部完成;`1` = 停下來等人或流程錯誤(`guards` 也是)。
+`guards` 是唯讀的,跑在別台時它比 `tmux attach` 好用得多,見 §7。
 
 **agent 的文字會即時進 log**,每則帶 `[implementer]` / `[reviewer]` 前綴,
 所以不用等 20–40 分鐘才知道它在幹嘛:
@@ -433,6 +435,8 @@ git status --short             # 正在寫哪些檔案
 | `reject --reason "..."` | 把 reason 當成**下一輪的 review 意見直接交給 implementer 並跳過 reviewer**,輪數歸零 |
 | `retry` | 輪數用盡卡住後重置輪數,保留 PR 與 session |
 | `reset` | 整個清掉重來 |
+
+前三個在手機上也下得了(`tgbot`,見 §7);`reset` 刻意只能在機器上下。
 
 **`approve` 會繞過 `verify_command`。** 它直接把 phase 設成 merge —— 人已經
 裁決過了。所以「我想再跑一次驗收」不能用 `approve`,要用 `reject`。
@@ -528,6 +532,36 @@ tmux kill-session -t guard-formosa  # 換掉它
 印出 attach 指令然後退出。(兩個守護 agent 會對同一個 gate 各自下決策 ——
 一個 approve 一個 reject,而且兩個都會去重啟 `run`。)
 
+#### 同時顧多條 pipeline:`guards`(複數)
+
+`tmux attach` 一次只看得到一個,而且要先記得 session 叫什麼。同時開多個專案時
+用 `guards` —— 掃一個目錄底下所有 config,配上 tmux 裡活著的守護 agent,
+一條 pipeline 一行:
+
+```bash
+ssh mac 'cd ~/Documents/agents-dev-tools && .venv/bin/python -m milestone_pipeline guards'
+```
+
+```
+guard-formosa   formosa.yaml      M13 review  round=1  ~$7.28  5 分鐘前
+guard-shopapp   shopapp.yaml      M2 await_human  (merge_gate)  41 分鐘前  ⚠
+    放行: python -m milestone_pipeline approve --milestone 2 --config shopapp.yaml
+    打回: python -m milestone_pipeline reject --milestone 2 --reason "..." --config shopapp.yaml
+    看它: tmux attach -r -t guard-shopapp
+(無 guard)      sideproj.yaml     M4 stuck  3 小時前  ⚠ 沒有守護 agent 在顧
+```
+
+它吃 `--dir`(預設當前目錄)**不吃 `--config`**,exit code 沿用 `status`
+(有東西等人就回 1)。**唯讀** —— 不取鎖、不寫 state,隨時跑都安全。
+
+⚠ 只給「停下來等人」,**不給「多久沒動」**:implement 階段跑一小時不寫存檔是
+正常的,拿時間當卡住的代理一定誤報。時間照印,判斷留給你。同理「沒有守護
+agent」本身不是問題(`nohup … run` 就是這樣跑的),只有**停下來等人而且沒有
+守護 agent 會去按**才會被點名 —— 那才是真的沒人會來。
+
+`pipeline.yaml`(範本,`repo.path` 是佔位字串)與目錄裡其他 yaml 會被安靜略過;
+但「有守護 agent 在顧、config 卻載不起來」會印出來,那是真的壞了。
+
 從另一台機器起飛就是普通的 ssh,不用 `nohup`,tmux 已經處理了持久化:
 
 ```bash
@@ -580,6 +614,31 @@ Windows 兩個都沒有 —— 沒 tmux 就退回前景跑(關掉終端就沒了
 這兩件事都印出來然後照常跑(deny 與 prompt 兩邊都是跨平台的)。
 這不影響實務:implementer 的 session_id 綁在跑它那台,pipeline 本來就固定
 在同一台跑完(見 config 開頭)。
+
+#### 從 Telegram 下決策(人自己要顧的時候)
+
+守護 agent 是「沒有人在」時的代理。**你自己要顧、但人不在電腦前**時走 `tgbot`:
+
+```bash
+# 兩個環境變數缺一個就拒絕啟動(chat id 是唯一的存取控制)
+nohup .venv/bin/python -m milestone_pipeline tgbot >> ~/tgbot.log 2>&1 < /dev/null &
+```
+
+手機上:`/guards`、`/status formosa`、`/approve formosa 13`、
+`/reject formosa 13 <理由>`、`/retry formosa 13`。專案名就是 config 檔名去掉
+副檔名。**決策成功後 bot 會自己重啟 `run`**(`~/pipeline-<stem>.log`)——
+不重啟的話 approve 完 pipeline 還是停在那裡,等於沒真的從手機推動它。
+
+用 `nohup` 不用 tmux:bot 不讀 stdin,同 orchestrator 的分界(守護 agent 才需要
+tmux,因為 unsnooze 是往 pane 裡打字喚醒它的)。所以它**不會**出現在 `guards`
+的清單裡,要確認活著用 `pgrep -f "milestone_pipeline tgbot"`。
+
+**`reset` 刻意不在指令表裡** —— 不可逆的清除不該掛在一個手機打字打錯就會觸發
+的介面上,要 reset 就回機器上下。
+
+守護 agent 與 `tgbot` 可以同時開,但**同一個 park 點不要兩邊都去按**:兩個
+決策者對同一個 gate 各自下決策,結果跟開兩個守護 agent 一樣。實務上的分工是
+守護 agent 顧 `agent_error`(機械性恢復),`merge_gate` 留給你在手機上驗。
 
 ## 8. crash / 重開機之後
 
