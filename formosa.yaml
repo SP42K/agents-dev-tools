@@ -87,10 +87,24 @@ loop:
 notify:
   # park 之後 orchestrator 會 exit,沒通知就不會知道它停了。
   # desktop = 人在電腦前最即時;pr_comment = 決策紀錄留在 PR 上事後可追,
-  # 且 @mention 會走 GitHub 推播(人不在電腦前時的補位)。
-  channels: [desktop, pr_comment]
+  # 且 @mention 會走 GitHub 推播(人不在電腦前時的補位);
+  # telegram = 人不在電腦前也收得到,無人值守跑時唯一真的會被看到的那個。
+  channels: [desktop, pr_comment, telegram]
+  # **merge_gate 刻意不在裡面。** 它每個 milestone 都會來一次(M11 13:07、
+  # M12 13:45、M13 15:32…),而守護 agent 本來就會處理掉 —— 每次都推等於把
+  # 推播練成雜訊。濾掉的只有推播,狀態照樣存檔,`guards` 照樣看得到。
+  # 漏掉的那半(守護 agent 自己空轉)由下面的 escalate_after_min 補。
+  reasons: [stuck, agent_error, unresolved]
+  # 停下來超過這麼久還沒動,tgbot 的 watchdog 就推一次(不管在不在 reasons 裡)。
+  # **這是唯一還會告訴你「守護 agent 沒把它處理掉」的東西**,不要連它一起關。
+  escalate_after_min: 20
   mention: "@SP42K"
   webhook_url: ""
   webhook_format: discord
+  # 兩個都不進版控(這個 repo 是公開的):留空,吃環境變數
+  # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。token 是密鑰,chat id 是永久的
+  # 個人識別碼 —— 都不該進 git 歷史。任一個沒設就只記警告、不擋起飛。
+  telegram_token: ""
+  telegram_chat_id: ""
 
 state_file: .pipeline-state.json  # 寫進 formosa-mcp/,已加進該 repo 的 .gitignore

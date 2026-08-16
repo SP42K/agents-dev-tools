@@ -7,9 +7,20 @@
   python -m milestone_pipeline approve [--config pipeline.yaml] --milestone N
   python -m milestone_pipeline reject  [--config pipeline.yaml] --milestone N --reason "..."
   python -m milestone_pipeline guard   [--config pipeline.yaml]
+  python -m milestone_pipeline guards  [--dir .]
+  python -m milestone_pipeline tgbot   [--dir .]
 
 `guard` 起一個守護 agent 代替人顧這條 pipeline —— 它被關掉了所有寫入工具,
 只能 approve / reject(見 guard.py)。
+
+`guards`(複數)是唯讀報表:掃一個目錄底下所有 config,配上 tmux 裡活著的
+守護 agent,一條 pipeline 印一行。守護 agent 多半跑在別台,所以典型用法是
+`ssh mac 'cd ~/Documents/agents-dev-tools && .venv/bin/python -m
+milestone_pipeline guards'`。它不吃 `--config`,吃 `--dir`。
+
+`tgbot` 是同一份東西的 Telegram 前端:在手機上下 `/guards` / `/approve` /
+`/reject`,決策成功後自己重啟 `run`。存取控制只有 `TELEGRAM_CHAT_ID` 白名單,
+兩個環境變數缺一個就拒絕啟動(見 tgbot.py)。
 
 四個「人工介入」指令語意不同,不要混用:
   retry   —— 卡住(輪數用盡)後重置輪數,保留 PR 與 session
@@ -25,8 +36,9 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
-from . import guard, lock
+from . import guard, lock, tgbot
 from .config import Config
 from .notify import R_AGENT_ERROR, R_MERGE_GATE, R_UNRESOLVED
 from .orchestrator import Orchestrator, PipelineError
@@ -39,9 +51,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="milestone_pipeline")
     parser.add_argument(
         "command",
-        choices=["run", "status", "retry", "reset", "approve", "reject", "guard"],
+        choices=["run", "status", "retry", "reset", "approve", "reject",
+                 "guard", "guards", "tgbot"],
     )
     parser.add_argument("--config", default="pipeline.yaml")
+    parser.add_argument("--dir", default=".",
+                        help="guards 掃哪個目錄底下的 config(預設當前目錄)")
     parser.add_argument("--milestone", type=int, default=None,
                         help="reset 時只清掉指定 milestone 的進度;"
                              "retry / approve / reject 時指定目標 milestone")
@@ -54,6 +69,16 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # `guards` 掃的是一整個目錄的 config,不吃 `--config` —— 一定要在下面那行
+    # `Config.load(args.config)` **之前**分流,否則會先被預設的 `pipeline.yaml`
+    # (repo.path 是佔位字串)擋下來。
+    if args.command == "guards":
+        sys.exit(_guards(Path(args.dir)))
+
+    # 同上:`tgbot` 是跨專案的(一個 bot 管全部),吃 `--dir` 不吃 `--config`。
+    if args.command == "tgbot":
+        sys.exit(tgbot.serve(Path(args.dir)))
 
     cfg = Config.load(args.config)
 
@@ -172,6 +197,22 @@ def main() -> None:
             state.save(cfg.state_file)
             print(f"已清除 milestone {args.milestone} 的進度。")
         sys.exit(0)
+
+
+def _guards(workdir: Path) -> int:
+    """印出所有 pipeline 的一行摘要。exit code 沿用 `status`:有東西等人就回 1。"""
+    if not guard._resolve("tmux"):
+        # Windows 走這條(守護 agent 在這裡是前景跑的,沒有 session 可列)。
+        # 仍然把讀得到的 state 印出來 —— 降級,不是錯誤。
+        print("(沒有 tmux,列不出守護 agent 的 session,只印各條 pipeline 的存檔狀態)")
+    rows = guard.collect(workdir)
+    if not rows:
+        print(f"{workdir.resolve()} 底下沒有找到任何 pipeline config。")
+        return 0
+    for row in rows:
+        for line in row.lines():
+            print(line)
+    return 1 if any(r.attention for r in rows) else 0
 
 
 # -- 共用小工具 --------------------------------------------------------------

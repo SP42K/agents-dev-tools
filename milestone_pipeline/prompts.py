@@ -130,9 +130,17 @@ def guardian_task(config_path: str) -> str:
 {cli} run --config {config_path}
 ```
 
-然後架一個 log 監控,park / verdict / milestone 換手 / crash 都要收得到,
-不要用輪詢睡覺的方式等。收到 park 事件時,照系統提示的清單處理,
-決策完重啟 `run`。
+然後架一個 log 監控。**背景 task 只在 process 結束時才會叫醒你**,所以
+`tail -f | grep` 這種永不結束的寫法等於沒有監控 —— 你會坐在那裡等到天亮
+(實測過一次,park 之後空轉了 36 分鐘)。用命中就 exit 的形式,在背景跑:
+
+```bash
+tail -f -n0 <log 路徑> | grep -m1 -E '停下來等人|等待決策|Traceback|CRITICAL'
+```
+
+它一結束就代表出事了,那時再去看 `status` 與 log 尾巴確認停在哪。
+處理完、重啟 `run` 之後,**要再架一次**(`grep -m1` 命中就沒了)。
+決策照系統提示的那份清單走。
 
 停在 `merge_gate` 時可用的兩個出口:
 

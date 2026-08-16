@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import subprocess
@@ -329,28 +330,34 @@ def test_config_webhook_channel_requires_url(tmp_path):
         _cfg(tmp_path, **{"notify.channels": ["webhook"]})
 
 
-def test_config_telegram_channel_requires_chat_id(tmp_path, monkeypatch):
-    """chat id 缺 = 打錯字,炸;token 缺 = 這台沒設環境變數,不炸(降級在 make_notifier)。"""
-    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+def test_config_telegram_missing_creds_do_not_block_startup(tmp_path, monkeypatch):
+    """token / chat id 都不炸 —— 兩個都來自環境變數,而同一份 config 會在不同機器起。
+
+    通知是旁路,一台沒設環境變數的機器不該連 pipeline 都起不來。降級在
+    make_notifier()。`webhook_url` 是相反的:它只能寫在 config 裡,缺了就是打錯字。
+    """
+    from milestone_pipeline.config import TELEGRAM_CHAT_ID_ENV, TELEGRAM_TOKEN_ENV
 
     monkeypatch.delenv(TELEGRAM_TOKEN_ENV, raising=False)
-    with pytest.raises(SystemExit):
-        _cfg(tmp_path, **{"notify.channels": ["telegram"],
-                          "notify.telegram_token": "t"})
-    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
-                            "notify.telegram_chat_id": "1"})
+    monkeypatch.delenv(TELEGRAM_CHAT_ID_ENV, raising=False)
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"]})
     assert cfg.notify.telegram_token == ""
+    assert cfg.notify.telegram_chat_id == ""
 
 
-def test_config_telegram_token_falls_back_to_env(tmp_path, monkeypatch):
-    """token 不必寫進 yaml —— config 常跟 plan 一起放在目標 repo 裡。"""
-    from milestone_pipeline.config import TELEGRAM_TOKEN_ENV
+def test_config_telegram_creds_fall_back_to_env(tmp_path, monkeypatch):
+    """兩個都不必寫進 yaml —— token 是密鑰,chat id 是永久的個人識別碼,repo 是公開的。"""
+    from milestone_pipeline.config import TELEGRAM_CHAT_ID_ENV, TELEGRAM_TOKEN_ENV
 
     monkeypatch.setenv(TELEGRAM_TOKEN_ENV, "from-env")
+    monkeypatch.setenv(TELEGRAM_CHAT_ID_ENV, "854590099")
+    cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"]})
+    assert cfg.notify.telegram_token == "from-env"
+    assert cfg.notify.telegram_chat_id == "854590099"
+
+    # yaml 寫了就以 yaml 為準,且數字要轉成字串(urllib 送 JSON 時字串才安全)
     cfg = _cfg(tmp_path, **{"notify.channels": ["telegram"],
                             "notify.telegram_chat_id": 12345})
-    assert cfg.notify.telegram_token == "from-env"
-    # yaml 裡的數字 chat id 要能用(urllib 送 JSON 時字串才安全)
     assert cfg.notify.telegram_chat_id == "12345"
 
 
@@ -724,6 +731,42 @@ def test_multi_notifier_swallows_channel_failures():
     # 壞的排在前面,後面的仍要收到
     MultiNotifier([Boom(), Ok()]).notify(_decision())
     assert seen == [3]
+
+
+def test_notify_reasons_filters_which_parks_are_worth_pushing():
+    """`merge_gate` 每個 milestone 都會來一次,而守護 agent 本來就會處理掉。
+
+    濾掉的只有推播 —— 狀態照樣存檔,`status` / `guards` 照樣看得到。
+    真正的補位是 `tgbot` 的 watchdog(停太久沒人動才推),不是這個清單。
+    """
+    from milestone_pipeline.notify import (R_MERGE_GATE, R_STUCK,
+                                           MultiNotifier, Notifier)
+    seen = []
+
+    class Rec(Notifier):
+        def notify(self, decision):
+            seen.append(decision.reason)
+
+    n = MultiNotifier([Rec()], reasons=[R_STUCK])
+    n.notify(_decision(reason=R_MERGE_GATE))
+    assert seen == []                       # 守護 agent 的事,不吵人
+    n.notify(_decision(reason=R_STUCK))
+    assert seen == [R_STUCK]
+
+    # 沒設(None)= 全部推,維持舊行為
+    seen.clear()
+    MultiNotifier([Rec()]).notify(_decision(reason=R_MERGE_GATE))
+    assert seen == [R_MERGE_GATE]
+
+
+def test_config_validates_notify_reasons(tmp_path):
+    """reason 的值與 `MilestoneState.await_reason` 是同一組字串,打錯要當場炸。"""
+    from milestone_pipeline.config import PARK_REASONS
+    assert _cfg(tmp_path).notify.reasons == sorted(PARK_REASONS)   # 預設全部
+    cfg = _cfg(tmp_path, **{"notify.reasons": ["stuck", "agent_error"]})
+    assert cfg.notify.reasons == ["stuck", "agent_error"]
+    with pytest.raises(SystemExit):
+        _cfg(tmp_path, **{"notify.reasons": ["merge-gate"]})       # 底線寫成連字號
 
 
 def test_webhook_payload_shapes():
@@ -1135,6 +1178,11 @@ def test_guard_argv_carries_every_write_deny():
     # 擋不住 Bash 裡的 `cat > file`,但沒有 commit / push 就進不了 PR。
     assert "Write" in _DENY and "Bash(git commit:*)" in _DENY
 
+    # 沒有人會去按「允許」——ask 模式下第一個非 allowlist 的命令就掛住整條
+    # pipeline。deny 規則優先權更高,所以邊界沒有跟著鬆掉。
+    mode = argv.index("--permission-mode")
+    assert argv[mode + 1] == "bypassPermissions"
+
 
 def test_guard_argv_wraps_with_unsnooze_only_when_present():
     """unsnooze 是選用的,而且必須是 per-session 的包法(不是全域 hook)。
@@ -1148,6 +1196,39 @@ def test_guard_argv_wraps_with_unsnooze_only_when_present():
 
     assert plain[0] == "claude"
     assert wrapped[0] == "unsnooze" and wrapped[1:] == plain
+
+
+def test_guard_only_sends_accept_keys_when_the_dialog_is_there(monkeypatch):
+    """替人按安全聲明,所以只能在畫面上真的有那個對話框時送鍵。
+
+    盲送 `2` 會打進 agent 正在等的一般 prompt,那就變成隨機注入。
+    """
+    from milestone_pipeline import guard
+
+    sent: list[list[str]] = []
+    monkeypatch.setattr(guard.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guard.subprocess, "call", lambda a, **kw: sent.append(a) or 0)
+
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: "> 一般的 prompt,沒有對話框")
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is False
+    assert sent == [], "沒有對話框卻送了鍵"
+
+
+def test_guard_confirms_the_dialog_actually_went_away(monkeypatch):
+    """送完要再看一次 —— 同 new-session 之後回頭確認 session 還在的理由。"""
+    from milestone_pipeline import guard
+
+    monkeypatch.setattr(guard.time, "sleep", lambda _: None)
+    monkeypatch.setattr(guard.subprocess, "call", lambda a, **kw: 0)
+
+    # 一直都在 = 沒按掉,要回 False 讓呼叫端警告,不能送完就宣告成功
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: guard._BYPASS_PROMPT)
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is False
+
+    # 先有、送完就不見了 = 真的按掉了
+    seen = iter([guard._BYPASS_PROMPT, "", "", ""])
+    monkeypatch.setattr(guard, "_pane_text", lambda *a: next(seen, ""))
+    assert guard._accept_bypass_prompt("tmux", "guard-x", tries=2) is True
 
 
 def test_guard_spots_a_global_unsnooze_install(tmp_path):
@@ -1256,3 +1337,392 @@ def test_lock_file_is_excluded_from_the_workspace_fingerprint(tmp_path):
         assert workspace_fingerprint(tmp_path, ignore=ignore) == before
         # 沒排掉的話它確實看得見 —— 證明這個忽略項不是多餘的
         assert workspace_fingerprint(tmp_path, ignore=[state.name]) != before
+
+
+# -- guards(唯讀報表)--------------------------------------------------------
+
+def _guards_yaml(tmp_path, name):
+    """造一份最小的 pipeline config,state 檔各自分開(同一個目錄多條 pipeline)。"""
+    raw = {
+        "repo": {"path": str(tmp_path)},
+        "plan": {"path": "plan.md"},
+        "implementer": {"model": "fable"},
+        "reviewer": {"model": "opus"},
+        "state_file": f".{name}-state.json",
+    }
+    p = tmp_path / f"{name}.yaml"
+    p.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return p
+
+
+def test_guards_summarize_warns_only_when_parked(tmp_path):
+    """⚠ 的門檻是「停下來等人」,不是「多久沒動」。
+
+    implement 階段跑一小時不寫 state 是正常的,拿時間當代理會誤報 ——
+    同 `repo_warnings` 不拿分支名當「code 乾不乾淨」的代理那顆雷。
+    """
+    from milestone_pipeline.guard import summarize
+    from milestone_pipeline.state import PH_REVIEW
+    p = tmp_path / "formosa.yaml"
+
+    running = PipelineState(current=6, milestones={
+        "6": MilestoneState(phase=PH_REVIEW, review_round=3,
+                            implementer_cost_usd=21.4)})
+    # 三小時沒動,但它只是在跑 —— 不該有 ⚠,也不該多印指令
+    row = summarize(p, alive=True, state=running, mtime=0.0, now=10800.0)
+    assert row.attention is False
+    assert len(row.lines()) == 1
+    assert "⚠" not in row.lines()[0]
+    assert "guard-formosa" in row.lines()[0] and "round=3" in row.lines()[0]
+    assert "~$21.40" in row.lines()[0] and "3 小時前" in row.lines()[0]
+
+
+def test_guards_summarize_parked_prints_the_commands_and_the_attach(tmp_path):
+    """停下來時要能直接複製指令,不用再去翻 `status`(同 `status` 的作法)。"""
+    from milestone_pipeline.guard import summarize
+    p = tmp_path / "shopapp.yaml"
+    state = PipelineState(current=2, milestones={
+        "2": MilestoneState(phase=PH_AWAIT_HUMAN, await_reason="merge_gate")})
+
+    row = summarize(p, alive=True, state=state, mtime=0.0, now=60.0)
+    assert row.attention is True
+    body = "\n".join(row.lines())
+    assert "⚠" in row.lines()[0] and "(merge_gate)" in row.lines()[0]
+    assert "approve --milestone 2 --config shopapp.yaml" in body
+    assert "reject --milestone 2" in body
+    # 有守護 agent 在顧才印得出 attach 的入口
+    assert "tmux attach -r -t guard-shopapp" in body
+
+
+def test_guards_summarize_flags_parked_without_a_guard(tmp_path):
+    """「沒有守護 agent」本身不是問題,`nohup … run` 就是這樣跑的。
+
+    真正沒人會來的是「停下來等人 **而且** 沒有守護 agent」—— 警告只給這個組合。
+    """
+    from milestone_pipeline.guard import summarize
+    from milestone_pipeline.state import PH_STUCK
+    p = tmp_path / "sideproj.yaml"
+    stuck = PipelineState(current=4, milestones={
+        "4": MilestoneState(phase=PH_STUCK)})
+
+    row = summarize(p, alive=False, state=stuck, mtime=0.0, now=60.0)
+    assert row.attention is True
+    body = "\n".join(row.lines())
+    assert "沒有守護 agent 在顧" in body and "(無 guard)" in body
+    # stuck 要給的是 retry(輪數用盡),不是 approve
+    assert "retry --milestone 4" in body and "approve" not in body
+    assert "tmux attach" not in body          # 沒有 session 可以 attach
+
+    # 同一條 pipeline 還在跑的話,沒有守護 agent 不該有任何警告
+    from milestone_pipeline.state import PH_IMPLEMENT
+    running = PipelineState(current=4, milestones={
+        "4": MilestoneState(phase=PH_IMPLEMENT)})
+    assert summarize(p, False, running, 0.0, 60.0).attention is False
+
+
+def test_guards_collect_skips_yaml_that_is_not_a_pipeline_config(tmp_path,
+                                                                monkeypatch):
+    """目錄裡本來就有別的 yaml,還有 repo.path 是佔位字串的 `pipeline.yaml`。
+
+    一份載不起來的 config 不能把整份清單炸掉 —— 而 `Config.load` 丟的是
+    `SystemExit`,它**不是** `Exception` 的子類。
+    """
+    from milestone_pipeline import guard
+    monkeypatch.setattr(guard, "_resolve", lambda exe: None)   # 當作沒有 tmux
+
+    good = _guards_yaml(tmp_path, "good")
+    PipelineState(current=1, milestones={
+        "1": MilestoneState(phase=PH_AWAIT_HUMAN, await_reason="merge_gate")}
+    ).save(tmp_path / ".good-state.json")
+    # 不是 pipeline config
+    (tmp_path / "ci.yaml").write_text(yaml.safe_dump({"jobs": {}}), encoding="utf-8")
+    # 是 pipeline config,但 repo.path 不存在 → Config.load 丟 SystemExit
+    (tmp_path / "template.yaml").write_text(yaml.safe_dump({
+        "repo": {"path": "/nope/nope"}, "plan": {"path": "p.md"},
+        "implementer": {"model": "fable"}, "reviewer": {"model": "opus"},
+    }), encoding="utf-8")
+
+    rows = guard.collect(tmp_path, now=60.0)
+    assert [r.config for r in rows] == [good]
+    assert rows[0].attention is True
+
+
+def test_guards_collect_surfaces_a_broken_config_that_has_a_live_guard(
+        tmp_path, monkeypatch):
+    """安靜略過只對「不是 pipeline config」成立。
+
+    有守護 agent 正在顧、config 卻載不起來,那是真的壞了,不能跟著被吞掉。
+    """
+    from milestone_pipeline import guard
+    monkeypatch.setattr(guard, "_resolve", lambda exe: "tmux")
+    monkeypatch.setattr(guard, "list_sessions",
+                        lambda exe: ["guard-broken", "guard-ghost"])
+
+    (tmp_path / "broken.yaml").write_text(yaml.safe_dump({
+        "repo": {"path": "/nope/nope"}, "plan": {"path": "p.md"},
+        "implementer": {"model": "fable"}, "reviewer": {"model": "opus"},
+    }), encoding="utf-8")
+
+    rows = guard.collect(tmp_path, now=60.0)
+    body = "\n".join(ln for r in rows for ln in r.lines())
+    assert "config 載入失敗" in body
+    # 對不到任何 config 的 session 也要看得見(config 被改名或刪掉了)
+    assert "guard-ghost" in body and "找不到對應的 config" in body
+    assert all(r.attention for r in rows)
+
+
+def test_guards_summarize_handles_a_config_that_never_ran(tmp_path):
+    from milestone_pipeline.guard import summarize
+    row = summarize(tmp_path / "new.yaml", alive=False, state=None,
+                    mtime=None, now=60.0)
+    assert row.attention is False and "尚未開跑" in row.lines()[0]
+
+
+# -- Telegram 控制端點 --------------------------------------------------------
+
+def test_tgbot_parses_the_whitelisted_commands():
+    from milestone_pipeline.tgbot import parse_command
+    assert parse_command("/guards").verb == "guards"
+    # 群組裡 Telegram 會送成 /guards@my_bot
+    assert parse_command("/guards@my_bot").verb == "guards"
+
+    c = parse_command("/approve formosa 6")
+    assert (c.verb, c.project, c.milestone) == ("approve", "formosa", 6)
+
+    # 打回的理由是一段話,空白與換行都要原封不動留著
+    c = parse_command("/reject formosa 6 fixture 跟真實回應對不上\n再確認一次")
+    assert c.reason == "fixture 跟真實回應對不上\n再確認一次"
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "隨便講一句話",
+    "/reset formosa",            # 不可逆的清除刻意不在白名單裡
+    "/run formosa",              # 沒有任意命令這種東西
+    "/approve formosa",          # 少了 milestone
+    "/approve formosa -1",       # 不是正整數
+    "/approve formosa 1.5",
+    "/status",                   # 少了專案
+    "/reject formosa 6",         # reject 一定要有理由
+])
+def test_tgbot_rejects_anything_not_on_the_whitelist(text):
+    """認不得就 `None` —— 白名單,不是黑名單。"""
+    from milestone_pipeline.tgbot import parse_command
+    assert parse_command(text) is None
+
+
+def test_tgbot_chat_id_whitelist_fails_closed():
+    """chat id 是這個 bot 唯一的存取控制,所以每條退化路徑都要回 False。
+
+    尤其「沒設定」不能等於「放行所有人」—— 這與 notify 那邊缺設定只警告的
+    fail-open **刻意相反**:那裡缺了是收不到通知,這裡缺了是誰都能下 approve。
+    """
+    from milestone_pipeline.tgbot import authorized
+    mine = {"message": {"chat": {"id": 12345}, "text": "/guards"}}
+    assert authorized(mine, "12345")          # 數字 vs 字串也要對得起來
+
+    assert not authorized(mine, "99999")      # 別人的 chat
+    assert not authorized(mine, "")           # 沒設定
+    assert not authorized({}, "12345")        # 不是 message 的 update
+    # 把舊訊息編輯成 /approve 不該觸發決策
+    assert not authorized(
+        {"edited_message": {"chat": {"id": 12345}, "text": "/approve x 1"}}, "12345")
+
+
+def test_tgbot_project_name_is_a_table_lookup_not_a_path(tmp_path):
+    """專案名只能對到掃出來的 config,拼路徑的寫法要對不到任何東西。"""
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.tgbot import resolve_config
+    good = tmp_path / "formosa.yaml"
+    rows = [GuardRow(good, "guard-formosa"), GuardRow(None, "guard-ghost")]
+
+    assert resolve_config("formosa", rows) == good
+    for bad in ("../../etc/passwd", "formosa.yaml", "/etc/passwd", "nope", ""):
+        assert resolve_config(bad, rows) is None
+
+
+def _tg_msg(text, reply_to=None):
+    """造一則 Telegram update(白名單那關由呼叫端自己測)。"""
+    msg = {"chat": {"id": 1}, "text": text}
+    if reply_to:
+        msg["reply_to_message"] = {"text": reply_to}
+    return {"message": msg}
+
+
+def test_tgbot_handle_runs_the_verb_and_restarts_run(tmp_path, monkeypatch):
+    """決策成功才重啟 `run`;`status` 與失敗都不該重啟。"""
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    cfg = tmp_path / "formosa.yaml"
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(cfg, "guard-formosa")])
+
+    calls, restarts = [], []
+    monkeypatch.setattr(tgbot, "run_verb",
+                        lambda p, v, m=None, r="": (calls.append((v, m, r)), (0, "ok"))[1])
+    monkeypatch.setattr(tgbot, "restart_run", lambda p: restarts.append(p) or "/tmp/x.log")
+
+    msgs = tgbot.handle(_tg_msg("/approve formosa 6"), tmp_path)
+    assert calls == [("approve", 6, "")] and restarts == [cfg]
+    assert "已重啟 run" in msgs[0].text
+
+    # status 只是讀,不重啟(而且它停下來時本來就 exit 1)
+    restarts.clear()
+    monkeypatch.setattr(tgbot, "run_verb", lambda p, v, m=None, r="": (1, "停在 M6"))
+    assert "停在 M6" in tgbot.handle(_tg_msg("/status formosa"), tmp_path)[0].text
+    assert restarts == []
+
+    # 決策失敗也不重啟 —— state 沒動,重啟只會再 park 一次
+    assert "已重啟" not in tgbot.handle(_tg_msg("/approve formosa 6"), tmp_path)[0].text
+    assert restarts == []
+
+
+def test_tgbot_handle_reports_an_unknown_project(tmp_path, monkeypatch):
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(tmp_path / "formosa.yaml", "guard-formosa")])
+    reply = tgbot.handle(_tg_msg("/approve nope 1"), tmp_path)[0].text
+    assert "找不到專案" in reply and "formosa" in reply
+
+
+def test_tgbot_reject_button_asks_for_the_reason_then_uses_the_reply(
+        tmp_path, monkeypatch):
+    """打回的理由走 ForceReply:按鈕 → 提示 → 你回覆 → 理由接回同一個目標。
+
+    目標藏在提示訊息的文字裡(`[專案#N]`),因為 Telegram 回覆時會把原訊息帶
+    回來 —— bot 不用自己記狀態,重啟也不會忘記你在回哪一個。
+    """
+    from milestone_pipeline import tgbot
+    from milestone_pipeline.guard import GuardRow
+    cfg = tmp_path / "formosa.yaml"
+    monkeypatch.setattr(tgbot.guard, "collect",
+                        lambda d: [GuardRow(cfg, "guard-formosa")])
+    calls = []
+    monkeypatch.setattr(tgbot, "run_verb",
+                        lambda p, v, m=None, r="": (calls.append((v, m, r)), (0, "ok"))[1])
+    monkeypatch.setattr(tgbot, "restart_run", lambda p: "/tmp/x.log")
+
+    # 按下「❌ 打回」→ 還沒有理由,先問
+    prompt = tgbot.do_command(tgbot.parse_callback("r:formosa:6"), tmp_path)[0]
+    assert prompt.force_reply and "[formosa#6]" in prompt.text
+    assert calls == []                      # 這一步不能真的去 reject
+
+    # 回覆那則提示 → 整段文字就是理由
+    tgbot.handle(_tg_msg("fixture 跟真實回應對不上", reply_to=prompt.text), tmp_path)
+    assert calls == [("reject", 6, "fixture 跟真實回應對不上")]
+
+
+@pytest.mark.parametrize("stem", ["a&b", "福爾摩沙", "my.proj-2"])
+def test_tgbot_reply_target_survives_any_legal_config_stem(stem):
+    """`[專案#N]` 標記要吃得下任何合法的 config 檔名,不然打回會靜靜失效。
+
+    `&` 出去時被 `_esc` 換成 `&amp;`(Telegram 回來時可能已還原、也可能沒有),
+    CJK 則從頭到尾不在 ASCII 白名單裡 —— 兩種都對不回 stem 就等於按鈕壞掉。
+    驗證不在這裡,在 `resolve_config` 的查表(見上一個測試)。
+    """
+    from milestone_pipeline import tgbot
+    quoted = tgbot.reject_prompt(stem, 6).text
+    assert tgbot.reply_target(_tg_msg("理由", reply_to=quoted)) == (stem, 6)
+    assert tgbot.reply_target(
+        _tg_msg("理由", reply_to=html.unescape(quoted))) == (stem, 6)
+
+
+def test_tgbot_buttons_match_the_park_reason(tmp_path):
+    """`stuck` 給「續跑」不給「放行」—— `approve` 只吃 `await_human`。
+
+    擺錯的按鈕是一顆保證失敗的按鈕,而人在手機上看不出差別。
+    """
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.state import PH_IMPLEMENT, PH_STUCK
+    from milestone_pipeline.tgbot import row_buttons
+
+    stuck = GuardRow(tmp_path / "a.yaml", "guard-a", milestone=4,
+                     phase=PH_STUCK, started=True)
+    labels = [b["text"] for row in row_buttons(stuck) for b in row]
+    assert "▶️ 續跑" in labels and "✅ 放行" not in labels
+    assert [b["callback_data"] for r in row_buttons(stuck) for b in r
+            if "callback_data" in b] == ["t:a:4", "r:a:4"]
+
+    awaiting = GuardRow(tmp_path / "a.yaml", "guard-a", milestone=2,
+                        phase=PH_AWAIT_HUMAN, started=True)
+    assert "✅ 放行" in [b["text"] for r in row_buttons(awaiting) for b in r]
+
+    # 沒停下來就沒有東西好按
+    assert row_buttons(GuardRow(tmp_path / "a.yaml", "guard-a", milestone=1,
+                                phase=PH_IMPLEMENT, started=True)) is None
+
+
+def test_tgbot_callback_data_is_parsed_as_strictly_as_typed_input():
+    """按鈕不是比較可信的輸入 —— `callback_data` 一樣是網路上回來的字串。"""
+    from milestone_pipeline.tgbot import callback_data, parse_callback
+    c = parse_callback("a:formosa:13")
+    assert (c.verb, c.project, c.milestone) == ("approve", "formosa", 13)
+    for bad in ("", "a:formosa", "x:formosa:1", "a::1", "a:formosa:x",
+                "a:formosa:1:2", "reset:formosa:1"):
+        assert parse_callback(bad) is None
+
+    # 64 bytes 是 Telegram 的硬上限:超過就不放這顆按鈕,而不是送出去被 400
+    assert callback_data("a", "formosa", 13) == "a:formosa:13"
+    assert callback_data("a", "x" * 70, 1) is None
+
+
+def test_tgbot_escalates_only_after_the_park_has_sat_too_long(tmp_path):
+    """`guards` 的 ⚠ 不看時間,watchdog 才看 —— 兩者語意不同,不要混。
+
+    watchdog 看的是「**已經停下來**之後又過了多久」,那沒有誤報空間;
+    `guards` 若拿時間當代理,implement 階段跑一小時就會被誤判成卡住。
+    """
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.state import PH_REVIEW
+    from milestone_pipeline.tgbot import escalations
+
+    def row(**kw):
+        base = dict(config=tmp_path / "formosa.yaml", session="guard-formosa",
+                    started=True, milestone=6, phase=PH_AWAIT_HUMAN,
+                    await_reason="merge_gate", escalate_after_min=20)
+        return GuardRow(**{**base, **kw})
+
+    seen = set()
+    assert escalations([row(age_sec=600)], seen) == []        # 停了 10 分鐘,還早
+    assert len(escalations([row(age_sec=1800)], seen)) == 1   # 30 分鐘 → 推
+    assert escalations([row(age_sec=3600)], seen) == []       # 同一件事不重複推
+
+    # 在跑的不推,不管多久沒寫存檔
+    assert escalations([row(phase=PH_REVIEW, await_reason=None,
+                            age_sec=99999)], set()) == []
+
+    # 同一個 milestone 換了另一種卡法 → 那是新的一件事,要推
+    assert len(escalations([row(await_reason="stuck", age_sec=1800)], seen)) == 1
+
+
+def test_tgbot_html_escapes_everything_that_came_from_outside(tmp_path):
+    """HTML 排版的代價是跳脫 —— 漏一個 `<` 整則訊息就 400 送不出去。"""
+    from milestone_pipeline.guard import GuardRow
+    from milestone_pipeline.tgbot import render_row
+    row = GuardRow(tmp_path / "a<b>.yaml", "guard-a", started=True,
+                   milestone=1, phase="review & <fix>")
+    out = render_row(row)
+    assert "&lt;b&gt;" in out and "&amp;" in out
+    assert "<fix>" not in out
+
+
+def test_tgbot_serve_refuses_to_start_without_the_chat_id(tmp_path, monkeypatch):
+    """沒有白名單就等於對所有人開放 —— 這裡不降級成警告。"""
+    from milestone_pipeline import tgbot
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(SystemExit):
+        tgbot.serve(tmp_path)
+
+
+def test_tgbot_poll_once_survives_a_network_error(monkeypatch):
+    """一次網路抖動不該讓 bot 掛掉,而且 offset 不能因此前進。"""
+    import urllib.error
+
+    from milestone_pipeline import tgbot
+
+    def boom(*a, **kw):
+        raise urllib.error.URLError("nope")
+    monkeypatch.setattr(tgbot.urllib.request, "urlopen", boom)
+    assert tgbot.poll_once("token", 42) == ([], 42)
